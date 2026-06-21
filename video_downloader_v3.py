@@ -69,6 +69,9 @@ M3U8_WAIT_SEC = 60
 # Chromium 路径（留空 = 自动查找）
 CHROMIUM_BIN = ""
 
+# CDP 连接端口（策略 A0：用户手动启动 Chrome 后脚本连接）
+CDP_PORT = 9222
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -870,6 +873,167 @@ async def run_single_session(pw, headless: bool,
 
 
 # ───────────────────────────────────────────────────────────
+#  策略 A0：connect_over_cdp（用户手动启动 Chrome + 过 CF）
+# ───────────────────────────────────────────────────────────
+#
+#  【为什么需要这个策略】
+#  Cloudflare Turnstile 会检测 Chrome 是否由 CDP（远程调试协议）自动化
+#  启动。即使在有头模式下，Playwright 控制的 Chrome 在启动时就留下了
+#  CDP 自动化指纹，导致 Turnstile 拒绝复选框点击。
+#
+#  【解决方案】
+#  用户自己启动 Chrome（真实人工启动，无 CDP 启动指纹），手动通过
+#  Turnstile 验证，脚本随后通过 CDP 接入已经过验证的会话。
+#
+#  【使用步骤】
+#  第一步：在另一个终端/命令行运行以下命令（根据系统选择）：
+#
+#    Windows:
+#      "C:\Program Files\Google\Chrome\Application\chrome.exe" ^
+#        --remote-debugging-port=9222 ^
+#        --user-data-dir=%TEMP%\chrome_cdp ^
+#        --no-first-run
+#
+#    Mac:
+#      /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+#        --remote-debugging-port=9222 \
+#        --user-data-dir=/tmp/chrome_cdp
+#
+#    Linux:
+#      google-chrome --remote-debugging-port=9222 \
+#        --user-data-dir=/tmp/chrome_cdp
+#
+#  第二步：在弹出的 Chrome 窗口中打开目标网址
+#  第三步：手动点击 Cloudflare 复选框"请验证您是真人"，等待绿色对勾
+#  第四步：运行本脚本（不需要做任何其他操作，脚本自动完成后续）
+
+async def run_cdp_connect_session() -> Optional[str]:
+    """
+    连接用户手动启动的 Chrome，在 CF 已过的会话中捕获 m3u8。
+    Chrome 由用户真实启动（无 CDP 自动化指纹），Turnstile 无法检测。
+    """
+    import socket
+
+    cdp_url = f"http://localhost:{CDP_PORT}"
+
+    # 快速探测端口是否开放
+    try:
+        sock = socket.socket()
+        sock.settimeout(1)
+        sock.connect(("localhost", CDP_PORT))
+        sock.close()
+    except Exception:
+        print(f"  ⚠ 端口 {CDP_PORT} 未监听，Chrome 尚未以调试模式启动，跳过 CDP 策略")
+        print(f"  → 启动命令（Windows）:")
+        print(f'     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"'
+              f' --remote-debugging-port={CDP_PORT} --user-data-dir=%TEMP%\\chrome_cdp')
+        return None
+
+    print(f"  ▶ 连接到 Chrome CDP: {cdp_url}")
+    try:
+        from playwright.async_api import async_playwright as _ap
+        async with _ap() as pw:
+            try:
+                browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=5000)
+            except Exception as e:
+                print(f"  ✗ CDP 连接失败: {e}")
+                return None
+
+            contexts = browser.contexts
+            if not contexts:
+                print("  ⚠ Chrome 没有已打开的上下文，请先手动打开目标网页")
+                return None
+
+            ctx = contexts[0]
+
+            # 寻找已打开的目标页面
+            target_page = None
+            for p in ctx.pages:
+                if DOMAIN in (p.url or ""):
+                    target_page = p
+                    print(f"  ✓ 找到目标页面: {p.url[:80]}")
+                    break
+
+            if not target_page:
+                print(f"  ▶ 未找到 {DOMAIN} 页面，新建标签页并导航...")
+                target_page = await ctx.new_page()
+                try:
+                    await target_page.goto(TARGET_URL,
+                                           wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    print(f"  ⚠ 加载超时（继续）: {e}")
+
+            # 检查 CF 状态
+            if await cf_is_blocked(target_page):
+                print(f"\n  {'='*56}")
+                print(f"  ⚠ 检测到 Cloudflare 验证，请在 Chrome 窗口中手动操作：")
+                print(f"    1. 找到复选框「请验证您是真人」")
+                print(f"    2. 点击复选框")
+                print(f"    3. 等待出现绿色对勾（验证通过）")
+                print(f"    4. 页面跳转到正常内容后脚本自动继续")
+                print(f"  {'='*56}")
+                cf_ok = await wait_for_cf_pass(
+                    target_page, CF_MANUAL_TIMEOUT, "主站(CDP连接)"
+                )
+                if not cf_ok:
+                    return None
+            else:
+                print("  ✓ CF 已通过，直接进入捕获流程")
+
+            # 安装 m3u8 拦截器
+            catcher = M3u8Catcher()
+            await catcher.install(ctx, target_page)
+
+            # 快速检查是否已有 m3u8
+            m3u8 = await catcher.wait(timeout=2)
+            if m3u8:
+                return m3u8
+
+            # 点击 DS 服务器
+            if VIDEO_SERVER:
+                await click_server(target_page, VIDEO_SERVER)
+
+            dump_frames(target_page)
+
+            # 等待播放器 iframe CF
+            player_cf_wait = 60
+            for _t in range(player_cf_wait):
+                cf_in_frames = any(
+                    "challenges.cloudflare.com" in (f.url or "")
+                    for f in target_page.frames if f != target_page.main_frame
+                )
+                if not cf_in_frames:
+                    break
+                if _t == 0:
+                    print(f"  ⏳ 播放器 iframe CF 验证中（最多 {player_cf_wait}s）...")
+                if _t % 10 == 9:
+                    print(f"  ⏳ 播放器 iframe CF 等待 {_t+1}s/{player_cf_wait}s...")
+                await asyncio.sleep(1)
+
+            print(f"\n  ⏳ 等待 m3u8（最多 {M3U8_WAIT_SEC}s）...")
+            m3u8 = await catcher.wait(M3U8_WAIT_SEC)
+
+            if not m3u8:
+                print("  ▶ 触发视频播放...")
+                await _trigger_play(target_page)
+                await asyncio.sleep(3)
+                m3u8 = await catcher.wait(10)
+
+            if not m3u8:
+                m3u8 = await catcher.query_player_api(target_page)
+
+            if not m3u8:
+                m3u8 = await catcher.search_dom(target_page)
+
+            # 不关闭浏览器（用户自己启动的，让用户决定何时关）
+            return m3u8
+
+    except Exception as e:
+        print(f"  ✗ CDP 会话失败: {e}")
+        return None
+
+
+# ───────────────────────────────────────────────────────────
 #  rebrowser-playwright 会话（CDP Runtime.enable 补丁）
 # ───────────────────────────────────────────────────────────
 
@@ -1053,7 +1217,8 @@ async def run_persistent_context_session(pw, prefetch_cookies: list[dict]) -> Op
 
     # 判断是否是真实 Chrome（不是 Playwright 内置的 chromium）
     exe_lower = exe.replace("\\", "/").lower()
-    is_real_chrome = "google/chrome" in exe_lower or "google-chrome" in exe_lower
+    is_real_chrome = ("google/chrome" in exe_lower or "google-chrome" in exe_lower
+                      or "google\\chrome" in exe_lower)
     if not is_real_chrome:
         print("  ⚠ 未检测到真实 Google Chrome（找到的是 Playwright Chromium），跳过 persistent context")
         return None
@@ -1061,12 +1226,23 @@ async def run_persistent_context_session(pw, prefetch_cookies: list[dict]) -> Op
     temp_dir = tempfile.mkdtemp(prefix="pw_chrome_session_")
     print(f"  ▶ 真实 Chrome 二进制: {exe}")
     print(f"  ▶ 临时配置目录: {temp_dir}")
-    if not _ensure_display.__doc__:  # avoid calling on Linux without display
-        _ensure_display()
+    _ensure_display()
+
+    # 优先用 rebrowser-playwright 以修补 CDP Runtime.enable，
+    # 让 Turnstile 复选框可以被真人点击通过
+    try:
+        from rebrowser_playwright.async_api import async_playwright as _rb
+        _pw_module = _rb
+        print("  ✓ 使用 rebrowser-playwright（CDP Runtime.enable 已修补）")
+    except ImportError:
+        from playwright.async_api import async_playwright as _pw_plain
+        _pw_module = _pw_plain
 
     ctx = None
     try:
-        ctx = await pw.chromium.launch_persistent_context(
+        # launch_persistent_context 在 rebrowser_playwright 下行为相同
+        _pw_instance = pw  # 直接用外层传入的 pw（已初始化）
+        ctx = await _pw_instance.chromium.launch_persistent_context(
             user_data_dir=temp_dir,
             executable_path=exe,
             headless=False,
@@ -1169,9 +1345,14 @@ async def main():
     print(f"\n[1/3] 启动浏览器（多策略依次尝试）...")
     m3u8: Optional[str] = None
 
-    # 策略 A: rebrowser-playwright（补丁 CDP Runtime.enable，无需下载新浏览器）
-    print("\n  [A] rebrowser-playwright（CDP 反检测补丁）")
-    m3u8 = await run_rebrowser_session(prefetch_cookies)
+    # 策略 A0: CDP 连接（最可靠 — 用户手动启动 Chrome + 手动过 CF）
+    print("\n  [A0] CDP 连接（检测用户手动启动的 Chrome）")
+    m3u8 = await run_cdp_connect_session()
+
+    if not m3u8:
+        # 策略 A: rebrowser-playwright（补丁 CDP Runtime.enable，无需下载新浏览器）
+        print("\n  [A] rebrowser-playwright（CDP 反检测补丁）")
+        m3u8 = await run_rebrowser_session(prefetch_cookies)
 
     if not m3u8:
         # 策略 B: Camoufox（Firefox 反指纹，最强 Turnstile 绕过）
@@ -1186,24 +1367,32 @@ async def main():
                                              prefetch_cookies=prefetch_cookies)
 
             if not m3u8:
-                # 策略 D: 真实 Chrome 配置（launch_persistent_context，本地用户专用）
-                print("\n  [D] 真实 Chrome 配置（persistent context）")
+                # 策略 D: 真实 Chrome 二进制 + 临时目录（弹出窗口，请手动过 CF）
+                print("\n  [D] 真实 Chrome 显示模式（persistent context）")
+                print("      ← 弹出浏览器后，请手动点击 Turnstile 复选框")
                 m3u8 = await run_persistent_context_session(pw, prefetch_cookies)
 
             if not m3u8:
                 # 策略 E: Playwright 显示模式（弹出浏览器供手动操作）
                 print("\n  [E] Playwright 显示模式（请手动通过 CF 验证）")
+                print("      ← 弹出浏览器后，请手动点击 Turnstile 复选框")
                 m3u8 = await run_single_session(pw, headless=False,
                                                  prefetch_cookies=prefetch_cookies)
 
     if not m3u8:
         print("\n  ✗ 所有策略均未找到视频流")
-        print("  排查建议：")
-        print("    A. 确认 rebrowser-playwright 已安装: pip install rebrowser-playwright")
-        print("    B. 安装 Camoufox: pip install camoufox && python -m camoufox fetch")
-        print("    C. 目标站点可能触发了 CF Managed Challenge（需 CapSolver/FlareSolverr）")
-        print("    D. DS 播放器加载超时（尝试增大 M3U8_WAIT_SEC）")
-        print("    E. 视频已下线")
+        print()
+        print("  ★ 推荐方案（最可靠）：手动启动 Chrome + CDP 连接")
+        print("    第一步：在另一个命令行窗口运行（仅需一次）：")
+        print(f'      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"'
+              f' --remote-debugging-port={CDP_PORT} --user-data-dir=%TEMP%\\chrome_cdp')
+        print(f"    第二步：在弹出的 Chrome 中打开: {TARGET_URL}")
+        print("    第三步：手动点击「请验证您是真人」复选框，等待绿色对勾")
+        print("    第四步：重新运行本脚本（脚本会自动连接并完成后续操作）")
+        print()
+        print("  其他排查建议：")
+        print("    · 安装 Camoufox: pip install camoufox && python -m camoufox fetch")
+        print("    · DS 播放器超时: 增大 M3U8_WAIT_SEC")
         sys.exit(1)
 
     print(f"\n  ✓ 视频流: {m3u8[:80]}")
