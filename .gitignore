@@ -1,1 +1,5 @@
 __pycache__/
+downloads/
+*.mp4
+*.ts
+playlist_cache.m3u8
