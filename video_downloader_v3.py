@@ -404,6 +404,29 @@ class M3u8Catcher:
         await ctx.route("**/*", self._route_handler)
         page.on("response", self._response_handler)
 
+    async def install_passive(self, ctx: BrowserContext, page: Page):
+        """被动观察模式 — 不拦截请求（不触发 Fetch.enable），适用于 CDP connect 场景。
+        使用 ctx.on("response") 捕获全上下文响应 + CDP Network 事件覆盖跨域 iframe。"""
+        ctx.on("response", self._response_handler)
+        try:
+            cdp = await ctx.new_cdp_session(page)
+            await cdp.send("Network.enable", {
+                "maxTotalBufferSize": 0,
+                "maxResourceBufferSize": 0,
+                "maxPostDataSize": 0,
+            })
+
+            def _on_cdp_response(event):
+                url = event.get("response", {}).get("url", "")
+                if ".m3u8" in url.lower():
+                    print(f"\n  ✓ [CDP] 捕获 m3u8: {url[:90]}")
+                    self._set(url)
+
+            cdp.on("Network.responseReceived", _on_cdp_response)
+            print("  ✓ CDP Network 监听已启动（被动模式，不干扰请求）")
+        except Exception as e:
+            print(f"  ⚠ CDP Network 监听启动失败，降级为 response 监听: {e}")
+
     async def _route_handler(self, route: Route):
         url = route.request.url
         if ".m3u8" in url.lower() and not self._url:
@@ -619,6 +642,40 @@ def _find_chromium() -> Optional[str]:
     ):
         if Path(p).exists():
             return p
+    return None
+
+
+def _find_chrome_binary() -> Optional[str]:
+    """查找系统已安装的 Chrome/Chromium 可执行文件。"""
+    import os
+    candidates = []
+    if sys.platform == "win32":
+        for base in (os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                     os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                     os.environ.get("LOCALAPPDATA", "")):
+            if base:
+                candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+        candidates.append(Path("/Applications/Chromium.app/Contents/MacOS/Chromium"))
+    else:
+        for name in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium"):
+            found = shutil.which(name)
+            if found:
+                return found
+        candidates = [
+            Path("/usr/bin/google-chrome"),
+            Path("/usr/bin/chromium-browser"),
+            Path("/usr/bin/chromium"),
+        ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    # 最后尝试 PATH
+    for name in ("chrome", "google-chrome", "chromium"):
+        found = shutil.which(name)
+        if found:
+            return found
     return None
 
 
@@ -882,71 +939,102 @@ async def run_single_session(pw, headless: bool,
 #  CDP 自动化指纹，导致 Turnstile 拒绝复选框点击。
 #
 #  【解决方案】
-#  用户自己启动 Chrome（真实人工启动，无 CDP 启动指纹），手动通过
-#  Turnstile 验证，脚本随后通过 CDP 接入已经过验证的会话。
+#  脚本自动用 subprocess.Popen 启动 Chrome（带调试端口），Chrome 以普通
+#  用户模式启动，无任何 CDP 自动化指纹。脚本随后等待用户在弹出的 Chrome
+#  窗口中手动完成 Turnstile 验证，然后自动接管会话、捕获 m3u8。
 #
-#  【使用步骤】
-#  第一步：在另一个终端/命令行运行以下命令（根据系统选择）：
+#  【工作流程（全自动启动，仅需手动点一次复选框）】
+#  1. 脚本自动查找并启动 Chrome（带 --remote-debugging-port=9222）
+#  2. Chrome 弹出窗口，脚本自动导航到目标页面
+#  3. 若遇到 Cloudflare 验证：在 Chrome 窗口中点击「请验证您是真人」复选框
+#  4. 验证通过后脚本自动继续，无需其他操作
 #
-#    Windows:
-#      "C:\Program Files\Google\Chrome\Application\chrome.exe" ^
-#        --remote-debugging-port=9222 ^
-#        --user-data-dir=%TEMP%\chrome_cdp ^
-#        --no-first-run
-#
-#    Mac:
-#      /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-#        --remote-debugging-port=9222 \
-#        --user-data-dir=/tmp/chrome_cdp
-#
-#    Linux:
-#      google-chrome --remote-debugging-port=9222 \
-#        --user-data-dir=/tmp/chrome_cdp
-#
-#  第二步：在弹出的 Chrome 窗口中打开目标网址
-#  第三步：手动点击 Cloudflare 复选框"请验证您是真人"，等待绿色对勾
-#  第四步：运行本脚本（不需要做任何其他操作，脚本自动完成后续）
+#  【也支持预先手动启动 Chrome（端口已开放时跳过自动启动）】
+#  Windows:
+#    "C:\Program Files\Google\Chrome\Application\chrome.exe" ^
+#      --remote-debugging-port=9222 --user-data-dir=%TEMP%\chrome_cdp
+#  Mac/Linux:
+#    google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome_cdp
 
 async def run_cdp_connect_session() -> Optional[str]:
     """
-    连接用户手动启动的 Chrome，在 CF 已过的会话中捕获 m3u8。
-    Chrome 由用户真实启动（无 CDP 自动化指纹），Turnstile 无法检测。
+    自动启动 Chrome（调试模式）或连接用户已启动的 Chrome，完成 CF 验证后捕获 m3u8。
+
+    关键设计：
+    - Chrome 由 subprocess 启动（非 Playwright launch），无 CDP 自动化指纹
+    - connect_over_cdp 接入后使用被动 Network 监听，不触发 Fetch.enable
+    - 避免路由拦截干扰 lk1 播放器 iframe 的加载
     """
     import socket
+    import subprocess
+    import tempfile
 
     cdp_url = f"http://localhost:{CDP_PORT}"
+    chrome_proc = None
+    tmp_dir = None
 
-    # 快速探测端口是否开放
-    try:
-        sock = socket.socket()
-        sock.settimeout(1)
-        sock.connect(("localhost", CDP_PORT))
-        sock.close()
-    except Exception:
-        print(f"  ⚠ 端口 {CDP_PORT} 未监听，Chrome 尚未以调试模式启动，跳过 CDP 策略")
-        print(f"  → 启动命令（Windows）:")
-        print(f'     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"'
-              f' --remote-debugging-port={CDP_PORT} --user-data-dir=%TEMP%\\chrome_cdp')
-        return None
+    def _port_open() -> bool:
+        try:
+            s = socket.socket()
+            s.settimeout(0.5)
+            s.connect(("localhost", CDP_PORT))
+            s.close()
+            return True
+        except Exception:
+            return False
 
-    print(f"  ▶ 连接到 Chrome CDP: {cdp_url}")
+    if _port_open():
+        print(f"  ✓ 检测到 Chrome 已在调试模式运行（端口 {CDP_PORT}）")
+    else:
+        chrome_bin = _find_chrome_binary()
+        if not chrome_bin:
+            print(f"  ⚠ 未找到 Chrome，跳过 CDP 策略（安装 Chrome 后重试）")
+            return None
+
+        tmp_dir = tempfile.mkdtemp(prefix="chrome_cdp_")
+        cmd = [
+            chrome_bin,
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={tmp_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+        ]
+        print(f"  ▶ 自动启动 Chrome: {Path(chrome_bin).name}")
+        try:
+            chrome_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"  ✗ Chrome 启动失败: {e}")
+            return None
+
+        # 等待 Chrome 就绪（最多 10s）
+        for _ in range(20):
+            if _port_open():
+                break
+            await asyncio.sleep(0.5)
+        else:
+            print("  ✗ Chrome 启动超时（10s）")
+            chrome_proc.terminate()
+            return None
+        print(f"  ✓ Chrome 已启动，调试端口 {CDP_PORT}")
+
     try:
         from playwright.async_api import async_playwright as _ap
         async with _ap() as pw:
             try:
-                browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=5000)
+                browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=8000)
             except Exception as e:
                 print(f"  ✗ CDP 连接失败: {e}")
                 return None
 
-            contexts = browser.contexts
-            if not contexts:
-                print("  ⚠ Chrome 没有已打开的上下文，请先手动打开目标网页")
+            ctx = browser.contexts[0] if browser.contexts else None
+            if ctx is None:
+                print("  ⚠ Chrome 没有已打开的上下文")
                 return None
 
-            ctx = contexts[0]
-
-            # 寻找已打开的目标页面
+            # 找到或创建目标页面
             target_page = None
             for p in ctx.pages:
                 if DOMAIN in (p.url or ""):
@@ -955,60 +1043,67 @@ async def run_cdp_connect_session() -> Optional[str]:
                     break
 
             if not target_page:
-                print(f"  ▶ 未找到 {DOMAIN} 页面，新建标签页并导航...")
+                print(f"  ▶ 导航到: {TARGET_URL}")
                 target_page = await ctx.new_page()
                 try:
                     await target_page.goto(TARGET_URL,
                                            wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
-                    print(f"  ⚠ 加载超时（继续）: {e}")
+                    print(f"  ⚠ 加载中（继续等待）: {type(e).__name__}")
 
             # 检查 CF 状态
             if await cf_is_blocked(target_page):
                 print(f"\n  {'='*56}")
-                print(f"  ⚠ 检测到 Cloudflare 验证，请在 Chrome 窗口中手动操作：")
-                print(f"    1. 找到复选框「请验证您是真人」")
-                print(f"    2. 点击复选框")
-                print(f"    3. 等待出现绿色对勾（验证通过）")
-                print(f"    4. 页面跳转到正常内容后脚本自动继续")
+                print(f"  ⚠ 检测到 Cloudflare 验证 — 请在 Chrome 窗口中：")
+                print(f"    1. 点击复选框「请验证您是真人」")
+                print(f"    2. 等待绿色对勾，页面跳转后脚本自动继续")
                 print(f"  {'='*56}")
                 cf_ok = await wait_for_cf_pass(
-                    target_page, CF_MANUAL_TIMEOUT, "主站(CDP连接)"
+                    target_page, CF_MANUAL_TIMEOUT, "主站(CDP)"
                 )
                 if not cf_ok:
                     return None
             else:
                 print("  ✓ CF 已通过，直接进入捕获流程")
 
-            # 安装 m3u8 拦截器
+            # 被动模式：只监听响应，不拦截请求（避免 Fetch.enable 影响 lk1 iframe 加载）
             catcher = M3u8Catcher()
-            await catcher.install(ctx, target_page)
+            await catcher.install_passive(ctx, target_page)
 
-            # 快速检查是否已有 m3u8
+            # 快速检查是否已在播放（已有 m3u8）
             m3u8 = await catcher.wait(timeout=2)
             if m3u8:
                 return m3u8
 
             # 点击 DS 服务器
             if VIDEO_SERVER:
+                print(f"  ▶ 切换到 {VIDEO_SERVER} 服务器...")
                 await click_server(target_page, VIDEO_SERVER)
 
             dump_frames(target_page)
 
-            # 等待播放器 iframe CF
-            player_cf_wait = 60
-            for _t in range(player_cf_wait):
-                cf_in_frames = any(
-                    "challenges.cloudflare.com" in (f.url or "")
-                    for f in target_page.frames if f != target_page.main_frame
+            # 等待 lk1 播放器 iframe 真正加载（从 about:blank 变为实际 URL）
+            print("  ⏳ 等待播放器 iframe 初始化...")
+            for _t in range(45):
+                frames = target_page.frames
+                # CF 子 iframe 检测
+                if any("challenges.cloudflare.com" in (f.url or "") for f in frames):
+                    if _t == 0:
+                        print("  ⏳ 播放器 iframe CF 验证中（最多 45s）...")
+                    await asyncio.sleep(1)
+                    continue
+                # 检查是否有 lk1/playmogo 播放器 frame 且已离开 about:blank
+                player_ready = any(
+                    any(kw in (f.url or "") for kw in _PLAYER_KW)
+                    and (f.url or "").startswith("http")
+                    for f in frames
                 )
-                if not cf_in_frames:
+                if player_ready:
+                    await asyncio.sleep(2)  # 等播放器内部 JS 初始化
                     break
-                if _t == 0:
-                    print(f"  ⏳ 播放器 iframe CF 验证中（最多 {player_cf_wait}s）...")
-                if _t % 10 == 9:
-                    print(f"  ⏳ 播放器 iframe CF 等待 {_t+1}s/{player_cf_wait}s...")
                 await asyncio.sleep(1)
+
+            dump_frames(target_page)
 
             print(f"\n  ⏳ 等待 m3u8（最多 {M3U8_WAIT_SEC}s）...")
             m3u8 = await catcher.wait(M3U8_WAIT_SEC)
@@ -1025,12 +1120,24 @@ async def run_cdp_connect_session() -> Optional[str]:
             if not m3u8:
                 m3u8 = await catcher.search_dom(target_page)
 
-            # 不关闭浏览器（用户自己启动的，让用户决定何时关）
             return m3u8
 
     except Exception as e:
         print(f"  ✗ CDP 会话失败: {e}")
         return None
+    finally:
+        # 只有脚本自己启动的 Chrome 才自动关闭
+        if chrome_proc:
+            try:
+                chrome_proc.terminate()
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            if tmp_dir:
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
 
 # ───────────────────────────────────────────────────────────
@@ -1345,8 +1452,8 @@ async def main():
     print(f"\n[1/3] 启动浏览器（多策略依次尝试）...")
     m3u8: Optional[str] = None
 
-    # 策略 A0: CDP 连接（最可靠 — 用户手动启动 Chrome + 手动过 CF）
-    print("\n  [A0] CDP 连接（检测用户手动启动的 Chrome）")
+    # 策略 A0: CDP 连接（自动启动 Chrome + 用户手动过 CF 复选框一次即可）
+    print("\n  [A0] CDP 连接（自动启动 Chrome，仅需手动通过 Turnstile）")
     m3u8 = await run_cdp_connect_session()
 
     if not m3u8:
@@ -1382,13 +1489,12 @@ async def main():
     if not m3u8:
         print("\n  ✗ 所有策略均未找到视频流")
         print()
-        print("  ★ 推荐方案（最可靠）：手动启动 Chrome + CDP 连接")
-        print("    第一步：在另一个命令行窗口运行（仅需一次）：")
-        print(f'      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"'
+        print("  ★ 排查建议：")
+        print("    A0 策略需要系统已安装 Chrome（脚本自动启动）")
+        print("    Chrome 弹出后请手动点击「请验证您是真人」复选框")
+        print(f"    也可提前手动启动 Chrome（端口 {CDP_PORT} 开放后脚本自动连接）："
+              f'\n      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"'
               f' --remote-debugging-port={CDP_PORT} --user-data-dir=%TEMP%\\chrome_cdp')
-        print(f"    第二步：在弹出的 Chrome 中打开: {TARGET_URL}")
-        print("    第三步：手动点击「请验证您是真人」复选框，等待绿色对勾")
-        print("    第四步：重新运行本脚本（脚本会自动连接并完成后续操作）")
         print()
         print("  其他排查建议：")
         print("    · 安装 Camoufox: pip install camoufox && python -m camoufox fetch")
