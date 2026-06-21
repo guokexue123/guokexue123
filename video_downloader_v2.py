@@ -925,32 +925,108 @@ async def click_server(page: Page, server: str) -> bool:
     """点击视频线路按钮（DS/TV/ST/JPA 等）。"""
     if not server:
         return False
+
+    # 1. 等待网络空闲，确保 JS 渲染完毕（domcontentloaded 触发太早）
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
+
+    # 2. 尝试多种选择器等待服务器按钮出现（最多 8 秒）
+    _wait_sels = (
+        f":text('{server}')",
+        "[class*='server']", "[class*='source']", "[class*='sorc']",
+        "[class*='tab']", "[class*='btn']",
+    )
+    for sel in _wait_sels:
+        try:
+            await page.wait_for_selector(sel, timeout=2000)
+            break
+        except Exception:
+            continue
+
+    # 3. 先滚动到页面中部，触发懒加载
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
+        await asyncio.sleep(0.5)
+    except Exception:
+        pass
+
+    # 4. 尝试精确 + 模糊选择器点击（has-text 比 text-is 更宽松）
     selectors = [
-        f"button:text-is('{server}')", f"a:text-is('{server}')",
-        f"li:text-is('{server}')",     f"span:text-is('{server}')",
-        f"div:text-is('{server}')",    f"[class*='server']:text-is('{server}')",
-        f"[class*='source']:text-is('{server}')", f":text('{server}')",
+        f":text-is('{server}')",
+        f":text('{server}')",
+        f"li:has-text('{server}')",
+        f"button:has-text('{server}')",
+        f"a:has-text('{server}')",
+        f"span:has-text('{server}')",
+        f"div:has-text('{server}')",
+        f"[class*='server']:has-text('{server}')",
+        f"[class*='source']:has-text('{server}')",
+        f"[class*='sorc']:has-text('{server}')",
+        f"[class*='tab']:has-text('{server}')",
+        f"[class*='{server.lower()}']",
     ]
     for sel in selectors:
         try:
             el = page.locator(sel).first
             if await el.count() > 0:
+                try:
+                    await el.scroll_into_view_if_needed()
+                except Exception:
+                    pass
                 await el.click(timeout=3000)
-                print(f"  ✓ 切换到 {server} 线路")
+                print(f"  ✓ 切换到 {server} 线路（选择器: {sel}）")
                 await asyncio.sleep(5)   # 等待播放器 iframe 重新加载
                 return True
         except Exception:
             continue
 
-    # 调试输出
+    # 5. JS 强制点击兜底（遍历所有元素查找文本精确匹配）
     try:
-        texts = await page.evaluate("""() => {
-            return [...document.querySelectorAll('button,a,li,[class*="server"],[class*="source"]')]
-                   .map(e => e.textContent.trim()).filter(t => t && t.length < 30);
+        clicked = await page.evaluate(f"""(server) => {{
+            const els = [...document.querySelectorAll('*')];
+            for (const el of els) {{
+                if (el.childElementCount === 0 && el.textContent.trim() === server) {{
+                    el.click();
+                    return el.tagName + '.' + el.className;
+                }}
+            }}
+            return null;
+        }}""", server)
+        if clicked:
+            print(f"  ✓ JS 强制点击 {server}（{clicked}）")
+            await asyncio.sleep(5)
+            return True
+    except Exception:
+        pass
+
+    # 6. 调试：输出页面叶节点文本 + 截图（帮助排查按钮实际文本）
+    try:
+        info = await page.evaluate("""() => {
+            return [...document.querySelectorAll('*')]
+                .filter(e => e.childElementCount === 0)
+                .map(e => {
+                    const cls = [...e.classList].join('.');
+                    const txt = e.textContent.trim();
+                    return txt ? `${e.tagName.toLowerCase()}${cls ? '.' + cls : ''}: "${txt}"` : '';
+                })
+                .filter(s => s && s.length < 120)
+                .slice(0, 60);
         }""")
-        print(f"  ⚠ 未找到 '{server}' 按钮，检测到: {list(dict.fromkeys(texts))[:15]}")
+        print(f"  ⚠ 未找到 '{server}' 按钮，页面叶节点（前20条）:")
+        for line in (info or [])[:20]:
+            print(f"    {line}")
     except Exception:
         print(f"  ⚠ 未找到 '{server}' 按钮")
+
+    try:
+        shot = DOWNLOAD_DIR / "debug_server.png"
+        await page.screenshot(path=str(shot), full_page=True)
+        print(f"  截图: {shot}（查看页面实际渲染状态）")
+    except Exception:
+        pass
+
     return False
 
 
@@ -1151,8 +1227,13 @@ async def main():
         except Exception as e:
             print(f"  ⚠ 加载超时（继续）: {e}")
 
+        # HEADLESS=False 时给用户充足时间手动过 CF 验证（300秒）
+        cf_timeout = 300 if not HEADLESS else CF_WAIT_SEC
+        if not HEADLESS and cf_timeout > CF_WAIT_SEC:
+            print(f"  ℹ 显示模式：CF 等待上限 {cf_timeout} 秒（可手动通过验证）")
+
         # 等待主站 CF
-        await CloudflareDetector.wait_pass(page, CF_WAIT_SEC, "主站")
+        await CloudflareDetector.wait_pass(page, cf_timeout, "主站")
 
         # CF 拦截检测（cf_clearance 失效时终止并指导用户）
         if await CloudflareDetector.is_blocked(page):
