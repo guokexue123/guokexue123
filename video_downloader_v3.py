@@ -166,20 +166,38 @@ async def cf_is_blocked(page: Page) -> bool:
 
 async def wait_for_cf_pass(page: Page, timeout: int, label: str = "页面") -> bool:
     """
-    等待 CF 验证通过。
-    精确检测，不受 CF 过渡页（"验证成功,正在加载..."）干扰。
+    等待 CF 验证通过，且真实页面内容已加载。
+    两个条件都满足才返回 True：
+      1. cf_is_blocked() → False（CF 拦截消失）
+      2. 页面有真实内容（服务器按钮 / article / .entry-content 等）
+    这样可以避免在 "验证成功。正在等待..." 过渡态误判通过。
     """
     import random
 
-    # 让页面先稳定 1.5 秒再开始检测（避免 CF Turnstile iframe 还没挂载就误判通过）
     await asyncio.sleep(1.5)
 
     for i in range(timeout):
         blocked = await cf_is_blocked(page)
         if not blocked:
-            if i > 0:
-                print(f"  ✓ {label} CF 验证通过（{i + 2}s）")  # +2 因为先等了 1.5s
-            return True
+            # CF 消失后，还需确认真实内容已渲染（过渡页没有这些元素）
+            try:
+                has_content = await page.evaluate("""() => {
+                    const sels = [
+                        "[class*='server']", "button.srv-btn", ".server-bar",
+                        "article", ".entry-content", "#content", ".post-content",
+                        "#player", "h1.title", ".post-title", ".entry-title",
+                        ".wp-content", ".video-wrap", "#player-container"
+                    ];
+                    return sels.some(s => document.querySelector(s));
+                }""")
+            except Exception:
+                has_content = False
+
+            if has_content:
+                if i > 0:
+                    print(f"  ✓ {label} CF 验证通过（{i + 2}s）")
+                return True
+            # CF 已消失但页面还在过渡态，继续等待
 
         # 模拟人类鼠标（有助于行为检测）
         if i % 5 == 4:
@@ -255,26 +273,33 @@ async def curl_cffi_prefetch(url: str) -> list[dict]:
 # ───────────────────────────────────────────────────────────
 
 async def click_server(page: Page, server: str) -> bool:
-    """点击服务器选择按钮（networkidle + 多策略 + JS 兜底）。"""
+    """点击服务器选择按钮（多策略 + JS 兜底）。"""
     if not server:
         return False
 
     print(f"  ▶ 切换到 {server} 服务器...")
 
-    # 等待页面 JS 完全渲染
-    try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
-    except Exception:
-        pass
-
-    # 等待服务器按钮出现（任意一个匹配即可）
-    for sel in (f":text('{server}')", "[class*='server']",
-                "[class*='source']", "[class*='sorc']", "li", "button"):
+    # 等待服务器按钮出现（真实内容优先，超时后再尝试）
+    # 不用 networkidle：networkidle 可能在 CF 过渡页就触发，此时按钮不存在
+    found_content = False
+    for sel in (
+        f":text('{server}')",
+        "button.srv-btn", "[class*='server']",
+        "[class*='source']", "[class*='sorc']", "li", "button",
+    ):
         try:
-            await page.wait_for_selector(sel, timeout=2000)
+            await page.wait_for_selector(sel, timeout=3000)
+            found_content = True
             break
         except Exception:
             continue
+
+    if not found_content:
+        # 最后兜底：等 networkidle（可能在过渡页）
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
 
     # 小幅滚动（触发懒加载，不超过 300px 避免滚过按钮行）
     try:
@@ -797,7 +822,24 @@ async def run_single_session(pw, headless: bool,
     # 打印 frame 树
     dump_frames(page)
 
-    # 等待播放器 CF（某些 DS 播放器自身也有 CF）
+    # 等待 DS 播放器 iframe 的 CF 验证通过（lk1.supremejav.com 等也有 CF）
+    # 从 frame 树检测是否有 challenges.cloudflare.com 子 iframe
+    player_cf_wait = 60 if not headless else 20
+    for _t in range(player_cf_wait):
+        cf_in_frames = any(
+            "challenges.cloudflare.com" in (f.url or "")
+            for f in page.frames
+            if f != page.main_frame
+        )
+        if not cf_in_frames:
+            break
+        if _t == 0:
+            print(f"  ⏳ 播放器 iframe CF 验证中（最多 {player_cf_wait}s）...")
+        if not headless and _t % 10 == 9:
+            print(f"  ⏳ 播放器 iframe CF 等待 {_t + 1}s/{player_cf_wait}s...")
+        await asyncio.sleep(1)
+
+    # 等待 m3u8（最多 M3U8_WAIT_SEC 秒）
     print(f"\n  ⏳ 等待 m3u8（最多 {M3U8_WAIT_SEC}s）...")
     m3u8 = await catcher.wait(M3U8_WAIT_SEC)
 
@@ -934,7 +976,7 @@ async def run_camoufox_session(prefetch_cookies: list[dict]) -> Optional[str]:
 
     print("  ▶ Camoufox（Firefox 反指纹浏览器）...")
     try:
-        async with AsyncCamoufox(headless=True, geoip=True) as browser:
+        async with AsyncCamoufox(headless=True) as browser:
             ctx = await browser.new_context(
                 locale="zh-CN",
                 ignore_https_errors=True,
@@ -994,27 +1036,38 @@ async def run_camoufox_session(prefetch_cookies: list[dict]) -> Optional[str]:
 
 async def run_persistent_context_session(pw, prefetch_cookies: list[dict]) -> Optional[str]:
     """
-    使用用户真实 Chrome 配置（User Data Dir）启动浏览器。
-    真实 GPU/WebGL 指纹 + 浏览历史 + 已有 Cookie，Turnstile 无法区分真人。
-    前提：运行前必须关闭所有 Chrome 窗口。
+    使用真实 Chrome 二进制 + 临时配置目录启动浏览器（显示模式）。
+
+    Chrome 115+ 禁止在默认 User Data Dir 上开启 CDP 远程调试，所以
+    不能直接用真实 profile。改用临时目录 + 真实 Chrome 可执行文件：
+      · 真实 Chrome 二进制 → 真实 GPU/WebGL/字体指纹
+      · 临时目录            → 绕过 Chrome 115+ CDP 限制
+      · 显示模式            → 允许用户手动通过 CF Turnstile
     """
-    profile = _find_chrome_user_data()
+    import tempfile
+
     exe = _find_chromium()
-
-    if not profile:
-        print("  ⚠ 未找到真实 Chrome 配置目录，跳过 persistent context")
-        return None
-
     if not exe:
         print("  ⚠ 未找到 Chrome/Chromium 可执行文件，跳过 persistent context")
         return None
 
-    print(f"  ▶ 真实 Chrome 配置: {profile}")
-    print("  ⚠ 请确保所有 Chrome 窗口已关闭！")
+    # 判断是否是真实 Chrome（不是 Playwright 内置的 chromium）
+    exe_lower = exe.replace("\\", "/").lower()
+    is_real_chrome = "google/chrome" in exe_lower or "google-chrome" in exe_lower
+    if not is_real_chrome:
+        print("  ⚠ 未检测到真实 Google Chrome（找到的是 Playwright Chromium），跳过 persistent context")
+        return None
 
+    temp_dir = tempfile.mkdtemp(prefix="pw_chrome_session_")
+    print(f"  ▶ 真实 Chrome 二进制: {exe}")
+    print(f"  ▶ 临时配置目录: {temp_dir}")
+    if not _ensure_display.__doc__:  # avoid calling on Linux without display
+        _ensure_display()
+
+    ctx = None
     try:
         ctx = await pw.chromium.launch_persistent_context(
-            user_data_dir=profile,
+            user_data_dir=temp_dir,
             executable_path=exe,
             headless=False,
             args=[
@@ -1027,10 +1080,13 @@ async def run_persistent_context_session(pw, prefetch_cookies: list[dict]) -> Op
         )
     except Exception as e:
         msg = str(e).lower()
-        if "already in use" in msg or "already running" in msg or "singleton" in msg:
+        if "non-default data directory" in msg or "remote-debugging" in msg:
+            print("  ✗ Chrome 拒绝 CDP（安全限制），跳过此策略")
+        elif "already in use" in msg or "singleton" in msg:
             print("  ✗ Chrome 正在运行！请关闭所有 Chrome 窗口后重试。")
         else:
             print(f"  ✗ persistent context 启动失败: {e}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
         return None
 
     try:
@@ -1049,16 +1105,18 @@ async def run_persistent_context_session(pw, prefetch_cookies: list[dict]) -> Op
             print(f"  ⚠ 加载超时（继续）: {e}")
 
         cf_timeout = CF_MANUAL_TIMEOUT
-        print(f"  ℹ 真实 Chrome 模式（最多 {cf_timeout}s）")
+        print(f"  ℹ 真实 Chrome 显示模式（请手动通过 CF 验证，最多 {cf_timeout}s）")
         cf_ok = await wait_for_cf_pass(page, cf_timeout, "主站(真实Chrome)")
         if not cf_ok:
             dump_frames(page)
             await ctx.close()
+            shutil.rmtree(temp_dir, ignore_errors=True)
             return None
 
         m3u8 = await catcher.wait(timeout=2)
         if m3u8:
             await ctx.close()
+            shutil.rmtree(temp_dir, ignore_errors=True)
             return m3u8
 
         if VIDEO_SERVER:
@@ -1081,6 +1139,7 @@ async def run_persistent_context_session(pw, prefetch_cookies: list[dict]) -> Op
             m3u8 = await catcher.search_dom(page)
 
         await ctx.close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
         return m3u8
 
     except Exception as e:
@@ -1089,6 +1148,7 @@ async def run_persistent_context_session(pw, prefetch_cookies: list[dict]) -> Op
             await ctx.close()
         except Exception:
             pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
         return None
 
 
