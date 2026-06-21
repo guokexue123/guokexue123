@@ -594,6 +594,33 @@ def _find_chromium() -> Optional[str]:
     return None
 
 
+def _find_chrome_user_data() -> Optional[str]:
+    """找到用户真实 Chrome 配置目录（Windows/Mac/Linux）。"""
+    import os
+    candidates = []
+    # Windows
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        candidates.append(Path(local) / "Google" / "Chrome" / "User Data")
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        candidates.append(Path(appdata) / ".." / "Local" / "Google" / "Chrome" / "User Data")
+    # Mac
+    candidates.append(Path.home() / "Library" / "Application Support" / "Google" / "Chrome")
+    # Linux
+    candidates.append(Path.home() / ".config" / "google-chrome")
+    candidates.append(Path.home() / ".config" / "chromium")
+
+    for p in candidates:
+        try:
+            resolved = p.resolve()
+            if resolved.exists() and (resolved / "Default").exists():
+                return str(resolved)
+        except Exception:
+            pass
+    return None
+
+
 async def _apply_stealth(page: Page):
     """应用 playwright-stealth（兼容 v1/v2）。"""
     try:
@@ -775,6 +802,271 @@ async def run_single_session(pw, headless: bool,
 
 
 # ───────────────────────────────────────────────────────────
+#  rebrowser-playwright 会话（CDP Runtime.enable 补丁）
+# ───────────────────────────────────────────────────────────
+
+async def run_rebrowser_session(prefetch_cookies: list[dict]) -> Optional[str]:
+    """
+    rebrowser-playwright 补丁 Playwright 的 CDP Runtime.enable 调用。
+    Cloudflare Turnstile 通过 Runtime.enable 检测自动化；
+    rebrowser 屏蔽该调用，让浏览器看起来是正常用户启动。
+    使用已有的 Chromium 二进制，无需下载额外文件。
+    """
+    try:
+        from rebrowser_playwright.async_api import async_playwright as rb_playwright
+    except ImportError:
+        print("  ⚠ rebrowser-playwright 未安装，跳过（pip install rebrowser-playwright）")
+        return None
+
+    print("  ▶ rebrowser-playwright（CDP Runtime.enable 补丁）...")
+    try:
+        async with rb_playwright() as pw:
+            exe = _find_chromium()
+            args = [
+                "--no-sandbox", "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--window-size=1920,1080",
+            ]
+            kw = dict(headless=True, args=args)
+            if exe:
+                kw["executable_path"] = exe
+            browser = await pw.chromium.launch(**kw)
+            ctx = await browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1920, "height": 1080},
+                ignore_https_errors=True,
+                locale="zh-CN",
+            )
+            if prefetch_cookies:
+                await ctx.add_cookies(prefetch_cookies)
+
+            page = await ctx.new_page()
+            await _apply_stealth(page)
+
+            catcher = M3u8Catcher()
+            await catcher.install(ctx, page)
+
+            print(f"  ▶ 加载: {TARGET_URL}")
+            try:
+                await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"  ⚠ 加载超时（继续）: {e}")
+
+            cf_ok = await wait_for_cf_pass(page, CF_AUTO_TIMEOUT, "主站(rebrowser)")
+            if not cf_ok:
+                dump_frames(page)
+                await browser.close()
+                return None
+
+            m3u8 = await catcher.wait(timeout=2)
+            if m3u8:
+                await browser.close()
+                return m3u8
+
+            if VIDEO_SERVER:
+                await click_server(page, VIDEO_SERVER)
+
+            dump_frames(page)
+            print(f"\n  ⏳ 等待 m3u8（最多 {M3U8_WAIT_SEC}s）...")
+            m3u8 = await catcher.wait(M3U8_WAIT_SEC)
+
+            if not m3u8:
+                await _trigger_play(page)
+                await asyncio.sleep(3)
+                m3u8 = await catcher.wait(10)
+
+            if not m3u8:
+                m3u8 = await catcher.query_player_api(page)
+
+            if not m3u8:
+                m3u8 = await catcher.search_dom(page)
+
+            await browser.close()
+            return m3u8
+
+    except Exception as e:
+        print(f"  ✗ rebrowser 失败: {e}")
+        return None
+
+
+# ───────────────────────────────────────────────────────────
+#  Camoufox 会话（Firefox 反指纹，最强 CF 绕过）
+# ───────────────────────────────────────────────────────────
+
+async def run_camoufox_session(prefetch_cookies: list[dict]) -> Optional[str]:
+    """
+    Camoufox = Firefox + 硬件指纹伪装，完全没有 CDP 自动化痕迹。
+    对 Cloudflare Turnstile 最有效。
+    安装: pip install camoufox && python -m camoufox fetch
+    """
+    try:
+        from camoufox.async_api import AsyncCamoufox
+    except ImportError:
+        print("  ⚠ camoufox 未安装，跳过（pip install camoufox && python -m camoufox fetch）")
+        return None
+
+    print("  ▶ Camoufox（Firefox 反指纹浏览器）...")
+    try:
+        async with AsyncCamoufox(headless=True, geoip=True) as browser:
+            ctx = await browser.new_context(
+                locale="zh-CN",
+                ignore_https_errors=True,
+            )
+            if prefetch_cookies:
+                await ctx.add_cookies(prefetch_cookies)
+
+            page = await ctx.new_page()
+            catcher = M3u8Catcher()
+            await catcher.install(ctx, page)
+
+            print(f"  ▶ 加载: {TARGET_URL}")
+            try:
+                await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"  ⚠ 加载超时（继续）: {e}")
+
+            cf_ok = await wait_for_cf_pass(page, CF_AUTO_TIMEOUT, "主站(Camoufox)")
+            if not cf_ok:
+                dump_frames(page)
+                return None
+
+            m3u8 = await catcher.wait(timeout=2)
+            if m3u8:
+                return m3u8
+
+            if VIDEO_SERVER:
+                await click_server(page, VIDEO_SERVER)
+
+            dump_frames(page)
+
+            print(f"\n  ⏳ 等待 m3u8（最多 {M3U8_WAIT_SEC}s）...")
+            m3u8 = await catcher.wait(M3U8_WAIT_SEC)
+
+            if not m3u8:
+                print("  ▶ 触发视频播放...")
+                await _trigger_play(page)
+                await asyncio.sleep(3)
+                m3u8 = await catcher.wait(10)
+
+            if not m3u8:
+                m3u8 = await catcher.query_player_api(page)
+
+            if not m3u8:
+                m3u8 = await catcher.search_dom(page)
+
+            return m3u8
+
+    except Exception as e:
+        print(f"  ✗ Camoufox 失败: {e}")
+        return None
+
+
+# ───────────────────────────────────────────────────────────
+#  真实 Chrome 配置会话（launch_persistent_context）
+# ───────────────────────────────────────────────────────────
+
+async def run_persistent_context_session(pw, prefetch_cookies: list[dict]) -> Optional[str]:
+    """
+    使用用户真实 Chrome 配置（User Data Dir）启动浏览器。
+    真实 GPU/WebGL 指纹 + 浏览历史 + 已有 Cookie，Turnstile 无法区分真人。
+    前提：运行前必须关闭所有 Chrome 窗口。
+    """
+    profile = _find_chrome_user_data()
+    exe = _find_chromium()
+
+    if not profile:
+        print("  ⚠ 未找到真实 Chrome 配置目录，跳过 persistent context")
+        return None
+
+    if not exe:
+        print("  ⚠ 未找到 Chrome/Chromium 可执行文件，跳过 persistent context")
+        return None
+
+    print(f"  ▶ 真实 Chrome 配置: {profile}")
+    print("  ⚠ 请确保所有 Chrome 窗口已关闭！")
+
+    try:
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=profile,
+            executable_path=exe,
+            headless=False,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080",
+            ],
+            ignore_https_errors=True,
+            locale="zh-CN",
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "already in use" in msg or "already running" in msg or "singleton" in msg:
+            print("  ✗ Chrome 正在运行！请关闭所有 Chrome 窗口后重试。")
+        else:
+            print(f"  ✗ persistent context 启动失败: {e}")
+        return None
+
+    try:
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+        if prefetch_cookies:
+            await ctx.add_cookies(prefetch_cookies)
+
+        catcher = M3u8Catcher()
+        await catcher.install(ctx, page)
+
+        print(f"  ▶ 加载: {TARGET_URL}")
+        try:
+            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            print(f"  ⚠ 加载超时（继续）: {e}")
+
+        cf_timeout = CF_MANUAL_TIMEOUT
+        print(f"  ℹ 真实 Chrome 模式（最多 {cf_timeout}s）")
+        cf_ok = await wait_for_cf_pass(page, cf_timeout, "主站(真实Chrome)")
+        if not cf_ok:
+            dump_frames(page)
+            await ctx.close()
+            return None
+
+        m3u8 = await catcher.wait(timeout=2)
+        if m3u8:
+            await ctx.close()
+            return m3u8
+
+        if VIDEO_SERVER:
+            await click_server(page, VIDEO_SERVER)
+
+        dump_frames(page)
+
+        print(f"\n  ⏳ 等待 m3u8（最多 {M3U8_WAIT_SEC}s）...")
+        m3u8 = await catcher.wait(M3U8_WAIT_SEC)
+
+        if not m3u8:
+            await _trigger_play(page)
+            await asyncio.sleep(3)
+            m3u8 = await catcher.wait(10)
+
+        if not m3u8:
+            m3u8 = await catcher.query_player_api(page)
+
+        if not m3u8:
+            m3u8 = await catcher.search_dom(page)
+
+        await ctx.close()
+        return m3u8
+
+    except Exception as e:
+        print(f"  ✗ persistent context 会话失败: {e}")
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+        return None
+
+
+# ───────────────────────────────────────────────────────────
 #  入口
 # ───────────────────────────────────────────────────────────
 
@@ -787,33 +1079,51 @@ async def main():
     print("\n[预热] curl-cffi TLS 指纹伪装...")
     prefetch_cookies = await curl_cffi_prefetch(TARGET_URL)
 
-    # ── Step 1+2 合并：单会话 CF 绕过 + 视频流捕获 ──────────────────
-    print(f"\n[1/2] 启动单会话浏览器...")
+    # ── Step 1: 多策略单会话 CF 绕过 + 视频流捕获 ───────────────────
+    print(f"\n[1/3] 启动浏览器（多策略依次尝试）...")
     m3u8: Optional[str] = None
 
-    async with async_playwright() as pw:
-        # 先尝试 headless
-        m3u8 = await run_single_session(pw, headless=True,
-                                         prefetch_cookies=prefetch_cookies)
-
-        if not m3u8:
-            print("\n  ⚠ headless 未通过 CF（Turnstile 需人工交互）")
-            print("  ▶ 切换显示模式（弹出浏览器，请手动点击 CF 验证）...")
-            m3u8 = await run_single_session(pw, headless=False,
-                                             prefetch_cookies=prefetch_cookies)
+    # 策略 A: rebrowser-playwright（补丁 CDP Runtime.enable，无需下载新浏览器）
+    print("\n  [A] rebrowser-playwright（CDP 反检测补丁）")
+    m3u8 = await run_rebrowser_session(prefetch_cookies)
 
     if not m3u8:
-        print("\n  ✗ 未找到视频流")
-        print("  可能原因：")
-        print("    1. CF Managed Challenge（需 CapSolver 或 FlareSolverr）")
-        print("    2. DS 播放器加载超时（尝试增大 M3U8_WAIT_SEC）")
-        print("    3. 视频已下线")
+        # 策略 B: Camoufox（Firefox 反指纹，最强 Turnstile 绕过）
+        print("\n  [B] Camoufox（Firefox + 反指纹）")
+        m3u8 = await run_camoufox_session(prefetch_cookies)
+
+    if not m3u8:
+        async with async_playwright() as pw:
+            # 策略 C: Playwright headless + stealth（快速，低 IP 风险）
+            print("\n  [C] Playwright headless + stealth")
+            m3u8 = await run_single_session(pw, headless=True,
+                                             prefetch_cookies=prefetch_cookies)
+
+            if not m3u8:
+                # 策略 D: 真实 Chrome 配置（launch_persistent_context，本地用户专用）
+                print("\n  [D] 真实 Chrome 配置（persistent context）")
+                m3u8 = await run_persistent_context_session(pw, prefetch_cookies)
+
+            if not m3u8:
+                # 策略 E: Playwright 显示模式（弹出浏览器供手动操作）
+                print("\n  [E] Playwright 显示模式（请手动通过 CF 验证）")
+                m3u8 = await run_single_session(pw, headless=False,
+                                                 prefetch_cookies=prefetch_cookies)
+
+    if not m3u8:
+        print("\n  ✗ 所有策略均未找到视频流")
+        print("  排查建议：")
+        print("    A. 确认 rebrowser-playwright 已安装: pip install rebrowser-playwright")
+        print("    B. 安装 Camoufox: pip install camoufox && python -m camoufox fetch")
+        print("    C. 目标站点可能触发了 CF Managed Challenge（需 CapSolver/FlareSolverr）")
+        print("    D. DS 播放器加载超时（尝试增大 M3U8_WAIT_SEC）")
+        print("    E. 视频已下线")
         sys.exit(1)
 
     print(f"\n  ✓ 视频流: {m3u8[:80]}")
 
-    # ── Step 3: 下载前 N 秒 ────────────────────────────────────────
-    print(f"\n[2/2] 下载前 {DOWNLOAD_SECONDS} 秒视频...")
+    # ── Step 2: 下载前 N 秒 ────────────────────────────────────────
+    print(f"\n[2/3] 下载前 {DOWNLOAD_SECONDS} 秒视频...")
     print(f"  输出: {OUTPUT_FILE}")
     ok = await VideoDownloader.download(m3u8, OUTPUT_FILE, DOWNLOAD_SECONDS)
 
