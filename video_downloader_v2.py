@@ -945,10 +945,10 @@ async def click_server(page: Page, server: str) -> bool:
         except Exception:
             continue
 
-    # 3. 先滚动到页面中部，触发懒加载
+    # 3. 小幅滚动触发 JS 初始化，但不超过 300px（避免滚过服务器按钮行）
     try:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
-        await asyncio.sleep(0.5)
+        await page.evaluate("window.scrollTo(0, Math.min(300, document.body.scrollHeight * 0.1))")
+        await asyncio.sleep(0.3)
     except Exception:
         pass
 
