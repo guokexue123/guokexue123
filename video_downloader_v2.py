@@ -222,32 +222,88 @@ class CloudflareDetector:
       3. Managed Challenge— cf-challenge-*
       4. Interstitial     — "Checking your browser"
 
-    比只检测 challenges.cloudflare.com iframe 更可靠。
+    【重要】使用 DOM 结构查询而非 HTML 关键词匹配。
+    原因：CF 被绕过后正常页面仍会加载 CF 追踪脚本（challenge-platform.js、
+    __cf$cv$params 等），HTML 中包含这些字符串，导致关键词匹配产生误判。
+    正确做法：只检测 CF 拦截页面独有的 DOM 结构（challenge form / iframe）。
     """
 
-    # 所有 CF 特征关键词
-    _CF_KEYS = [
-        "cf-turnstile",
-        "just a moment",
-        "checking your browser",
-        "cf-browser-verification",
-        "challenge-platform",
-        "cf-challenge",
-        "enable javascript and cookies",
-        "performing security verification",
-        "__cf$cv$params",
-    ]
+    # CF 拦截页独有的 DOM 选择器（正常页面绝不会有这些）
+    _CF_CHALLENGE_SELECTORS = (
+        "form#challenge-form",           # CF 挑战表单（所有 CF 拦截页共有）
+        "#cf-challenge-running",         # JS Challenge 运行态
+        ".cf-browser-verification",      # Managed Challenge
+        "#challenge-error-title",        # 挑战失败提示
+        "[id^='cf-chl-widget']",         # Turnstile widget 容器
+    )
+
+    # CF 拦截页精确标题（区分大小写无关，但必须完整匹配）
+    _CF_TITLES = frozenset({
+        "just a moment...",
+        "checking your browser...",
+        "attention required! | cloudflare",
+        "access denied",
+        "one more step",
+    })
+
+    # 页面有真实内容时的特征选择器（存在则肯定未被拦截）
+    _CONTENT_SELECTORS = (
+        "video",
+        "article",
+        ".entry-content",
+        "#content",
+        "main",
+        ".post-content",
+        "#player",
+        "nav",          # 正常页面有导航栏
+        "footer",       # 正常页面有页脚
+    )
 
     @classmethod
     async def is_blocked(cls, page: Page) -> bool:
-        """检测页面是否被 CF 拦截。"""
+        """
+        精确检测页面是否被 CF 拦截（无误判）。
+
+        检测顺序（优先快速路径）：
+          1. challenges.cloudflare.com iframe → 必定拦截
+          2. 页面有真实内容（nav/footer/video等）→ 必定未拦截
+          3. DOM 中存在 CF 挑战表单结构 → 拦截
+          4. 标题精确匹配 CF 拦截页标题 → 拦截
+          5. 其余情况 → 视为未拦截（宁可漏报，避免误报）
+        """
+        # 1. CF challenge iframe（最可靠，拦截页专属）
+        if cls.has_cf_iframe(page):
+            return True
+
         try:
-            html = (await page.content()).lower()
-            title = (await page.title()).lower()
+            # 2. 页面有真实内容 → 肯定未被拦截（快速路径）
+            #    JS 一次性查询所有选择器，避免多次 evaluate
+            has_content = await page.evaluate(f"""() => {{
+                const sels = {list(cls._CONTENT_SELECTORS)};
+                return sels.some(s => document.querySelector(s) !== null) ||
+                       document.querySelectorAll('a[href]').length > 8;
+            }}""")
+            if has_content:
+                return False
+
+            # 3. CF 挑战表单（拦截页专属 DOM 结构）
+            has_challenge = await page.evaluate(f"""() => {{
+                const sels = {list(cls._CF_CHALLENGE_SELECTORS)};
+                return sels.some(s => document.querySelector(s) !== null);
+            }}""")
+            if has_challenge:
+                return True
+
+            # 4. 页面标题精确匹配
+            title = (await page.title()).strip().lower()
+            if title in cls._CF_TITLES:
+                return True
+
         except Exception:
-            return False
-        combined = html[:3000] + title
-        return any(k in combined for k in cls._CF_KEYS)
+            pass
+
+        # 5. 无法判断时，默认视为未拦截（避免因误判导致程序退出）
+        return False
 
     @classmethod
     def has_cf_iframe(cls, page: Page) -> bool:
@@ -262,19 +318,30 @@ class CloudflareDetector:
         cls, page: Page, timeout: int = CF_WAIT_SEC, label: str = "页面"
     ) -> bool:
         """
-        等待 CF 验证自动通过（stealth 模式下 JS Challenge 通常数秒内完成）。
-        返回 True 表示通过，False 表示超时。
+        等待 CF 验证自动通过。
+
+        逻辑优化：
+          - 如果页面加载完毕且无 CF challenge iframe → 立即返回 True（快速路径）
+          - 只在检测到真实 CF challenge 时才等待完整 timeout
+          - stealth 模式下 JS Challenge 通常数秒内自动完成
         """
         import random
-        for i in range(timeout):
-            blocked = await cls.is_blocked(page)
-            has_cf  = cls.has_cf_iframe(page)
-            if not blocked and not has_cf:
-                if i > 0:
-                    print(f"  ✓ {label} CF 验证通过（等待 {i+1} 秒）")
-                return True
 
-            # 模拟人类随机鼠标移动
+        for i in range(timeout):
+            # 快速路径：无 challenge iframe 时只做轻量检测
+            has_cf_frame = cls.has_cf_iframe(page)
+
+            if not has_cf_frame:
+                # 没有 CF iframe，做 DOM 检测
+                blocked = await cls.is_blocked(page)
+                if not blocked:
+                    if i > 0:
+                        print(f"  ✓ {label} CF 验证通过（等待 {i+1} 秒）")
+                    return True
+                # 有 challenge form 但无 CF iframe（罕见），继续等待
+            # else: 有 CF iframe，肯定还在拦截，继续等待
+
+            # 模拟人类随机鼠标移动（有助于行为检测通过）
             if i % 4 == 3:
                 try:
                     await page.mouse.move(
