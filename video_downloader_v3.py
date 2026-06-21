@@ -647,7 +647,33 @@ async def _apply_stealth(page: Page):
         print("  ⚠ playwright-stealth 未安装")
 
 
+_xvfb_proc = None  # global: keep Xvfb alive for the process lifetime
+
+def _ensure_display():
+    """如果没有 $DISPLAY 且有 Xvfb，自动启动虚拟显示器。"""
+    import os
+    global _xvfb_proc
+    if os.environ.get("DISPLAY"):
+        return
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        return
+    import subprocess
+    try:
+        _xvfb_proc = subprocess.Popen(
+            [xvfb, ":99", "-screen", "0", "1920x1080x24"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        import time; time.sleep(0.8)
+        print("  ✓ 虚拟显示器 Xvfb :99 已启动")
+    except Exception as e:
+        print(f"  ⚠ Xvfb 启动失败: {e}")
+
+
 async def _launch_browser(pw, headless: bool):
+    if not headless:
+        _ensure_display()
     exe = _find_chromium()
     print(f"  Chromium: {exe or '(playwright 默认)'}")
     args = [
