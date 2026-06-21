@@ -1080,45 +1080,68 @@ async def run_cdp_connect_session() -> Optional[str]:
                 print(f"  ▶ 切换到 {VIDEO_SERVER} 服务器...")
                 await click_server(target_page, VIDEO_SERVER)
 
-            dump_frames(target_page)
-
-            # 等待 lk1 播放器 iframe 真正加载（从 about:blank 变为实际 URL）
-            print("  ⏳ 等待播放器 iframe 初始化...")
-            for _t in range(45):
-                frames = target_page.frames
-                # CF 子 iframe 检测
-                if any("challenges.cloudflare.com" in (f.url or "") for f in frames):
-                    if _t == 0:
-                        print("  ⏳ 播放器 iframe CF 验证中（最多 45s）...")
-                    await asyncio.sleep(1)
-                    continue
-                # 检查是否有 lk1/playmogo 播放器 frame 且已离开 about:blank
-                player_ready = any(
-                    any(kw in (f.url or "") for kw in _PLAYER_KW)
-                    and (f.url or "").startswith("http")
-                    for f in frames
-                )
-                if player_ready:
-                    await asyncio.sleep(2)  # 等播放器内部 JS 初始化
+            # 等待 lk1 iframe 加载出 URL（最多 15s）
+            lk1_url = None
+            for _t in range(15):
+                for f in target_page.frames:
+                    url = f.url or ""
+                    if ("lk1." in url or "supremejav.com" in url) and url.startswith("http"):
+                        lk1_url = url
+                        break
+                if lk1_url:
                     break
                 await asyncio.sleep(1)
 
             dump_frames(target_page)
 
-            print(f"\n  ⏳ 等待 m3u8（最多 {M3U8_WAIT_SEC}s）...")
-            m3u8 = await catcher.wait(M3U8_WAIT_SEC)
+            if lk1_url:
+                # ── 关键修复：OOPIF 网络请求在主页 CDP 会话中不可见 ──────────────
+                # Chrome Site Isolation 把 lk1.supremejav.com 放进独立渲染进程。
+                # 在新标签页直接打开 lk1 URL，使其成为主页面，网络监听完全生效。
+                print(f"  ▶ 新标签页打开播放器（规避 OOPIF 限制）: {lk1_url[:80]}")
+                player_page = await ctx.new_page()
+                player_page.on("response", catcher._response_handler)
+                try:
+                    await player_page.goto(
+                        lk1_url,
+                        wait_until="domcontentloaded",
+                        timeout=20000,
+                    )
+                except Exception as e:
+                    print(f"  ⚠ 播放器页加载: {type(e).__name__}")
 
-            if not m3u8:
-                print("  ▶ 触发视频播放...")
-                await _trigger_play(target_page)
-                await asyncio.sleep(3)
-                m3u8 = await catcher.wait(10)
+                # 等待播放器 JS 初始化后自动请求 m3u8
+                print(f"  ⏳ 等待 m3u8（最多 30s）...")
+                m3u8 = await catcher.wait(30)
 
-            if not m3u8:
-                m3u8 = await catcher.query_player_api(target_page)
+                if not m3u8:
+                    print("  ▶ 触发视频播放...")
+                    await _trigger_play(player_page)
+                    await asyncio.sleep(3)
+                    m3u8 = await catcher.wait(10)
 
-            if not m3u8:
-                m3u8 = await catcher.search_dom(target_page)
+                if not m3u8:
+                    m3u8 = await catcher.query_player_api(player_page)
+
+                if not m3u8:
+                    m3u8 = await catcher.search_dom(player_page)
+            else:
+                # 找不到 lk1 URL，降级到原来的 iframe 内捕获（等 60s）
+                print(f"  ⚠ 未找到 lk1 iframe URL，降级到 iframe 模式...")
+                print(f"  ⏳ 等待 m3u8（最多 {M3U8_WAIT_SEC}s）...")
+                m3u8 = await catcher.wait(M3U8_WAIT_SEC)
+
+                if not m3u8:
+                    print("  ▶ 触发视频播放...")
+                    await _trigger_play(target_page)
+                    await asyncio.sleep(3)
+                    m3u8 = await catcher.wait(10)
+
+                if not m3u8:
+                    m3u8 = await catcher.query_player_api(target_page)
+
+                if not m3u8:
+                    m3u8 = await catcher.search_dom(target_page)
 
             return m3u8
 
@@ -1499,6 +1522,8 @@ async def main():
         print("  其他排查建议：")
         print("    · 安装 Camoufox: pip install camoufox && python -m camoufox fetch")
         print("    · DS 播放器超时: 增大 M3U8_WAIT_SEC")
+        if sys.platform == "win32":
+            input("\n  按 Enter 键退出...")  # 防止 Windows 终端窗口闪退
         sys.exit(1)
 
     print(f"\n  ✓ 视频流: {m3u8[:80]}")
@@ -1516,6 +1541,8 @@ async def main():
         t = f"-t {DOWNLOAD_SECONDS} " if DOWNLOAD_SECONDS else ""
         print(f'\n  手动: ffmpeg -allowed_extensions ALL {t}'
               f'-i "{m3u8}" -c copy "{OUTPUT_FILE}"')
+        if sys.platform == "win32":
+            input("\n  按 Enter 键退出...")
         sys.exit(1)
 
 
