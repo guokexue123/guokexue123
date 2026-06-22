@@ -4,8 +4,11 @@ lxml>=4.9.0
 yt-dlp>=2024.1.0
 
 # ── 反爬核心依赖（强烈推荐安装） ──────────────────────────────────────────
-# curl_cffi：模拟真实 Chrome TLS 指纹，绕过 Cloudflare Bot Management
+# Level 0: 驱动真实 Chrome，能过 Cloudflare Managed Challenge / Turnstile
+DrissionPage>=4.0.0
+
+# Level 1: 模拟 Chrome TLS 指纹，绕过 JA3/JA4 检测
 curl_cffi>=0.6.0
 
-# cloudscraper：自动执行 Cloudflare JS 挑战，破解 IUAM（5秒盾）
+# Level 2: 执行旧版 CF JS 挑战
 cloudscraper>=1.2.71

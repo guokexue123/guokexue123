@@ -1,21 +1,17 @@
 """
 supjav.com 页面解析器
 
-负责：
-1. 获取目标页面 HTML（多级反爬绕过）
-2. 从 HTML 中提取所有视频源入口（iframe、script、data 属性）
-3. 返回候选嵌入 URL 列表，供各子提取器处理
-
 绕过策略（按优先级）：
-  Level 1 — curl_cffi：模拟真实 Chrome TLS 指纹（JA3/JA4），
-             这是破解 Cloudflare Bot Management 最有效的方法。
-  Level 2 — cloudscraper：自动执行 Cloudflare JS 挑战（适合旧版 CF）。
-  Level 3 — requests + 完整浏览器头：普通站点的最后兜底。
+  Level 0 — DrissionPage：驱动真实 Chrome，能执行 Cloudflare Managed Challenge/Turnstile JS 挑战。
+  Level 1 — curl_cffi：模拟 Chrome TLS 指纹（JA3/JA4），绕过 Bot Management。
+  Level 2 — cloudscraper：执行旧版 CF IUAM JS 挑战。
+  Level 3 — requests + 完整浏览器头：普通站点兜底。
 """
 
 import re
 import json
 import time
+import socket
 import logging
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -28,84 +24,152 @@ from config import HEADERS, TIMEOUT, MAX_RETRIES, PROXY
 logger = logging.getLogger(__name__)
 
 
+# ─── 代理连通性检测（TCP socket，不依赖第三方服务） ───────────────────────────
+
+def check_proxy() -> bool:
+    """
+    通过 TCP socket 测试代理端口是否可达。
+    不依赖 httpbin.org 等第三方服务，更可靠。
+    """
+    if not PROXY:
+        return False
+    parsed = urlparse(PROXY)
+    host = parsed.hostname
+    port = parsed.port
+    if not host or not port:
+        logger.warning(f"[proxy] 无法解析代理地址: {PROXY}")
+        return False
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.close()
+        logger.info(f"[proxy] 端口 {host}:{port} 连通正常")
+        return True
+    except OSError as e:
+        logger.warning(f"[proxy] 端口连接失败: {e}")
+        return False
+
+
+# ─── Level 0: DrissionPage（真实 Chrome，处理 CF JS 挑战） ────────────────────
+
+def _fetch_with_drissionpage(url: str, referer: str = "") -> Optional[str]:
+    """
+    驱动系统已安装的 Chrome 浏览器，能完整执行 Cloudflare
+    Managed Challenge / Turnstile JS 挑战。
+    安装：pip install DrissionPage
+    """
+    try:
+        from DrissionPage import ChromiumPage, ChromiumOptions
+    except ImportError:
+        logger.debug("[drission] DrissionPage 未安装，跳过 (pip install DrissionPage)")
+        return None
+
+    try:
+        co = ChromiumOptions()
+        co.headless(True)
+        co.set_argument("--no-sandbox")
+        co.set_argument("--disable-dev-shm-usage")
+        co.set_argument("--disable-blink-features=AutomationControlled")
+        co.set_argument("--disable-extensions")
+        co.set_pref("credentials_enable_service", False)
+
+        if PROXY:
+            co.set_proxy(PROXY)
+            logger.info(f"[drission] 使用代理: {PROXY}")
+
+        page = ChromiumPage(co)
+        try:
+            # 先访问首页热身（有助于 CF 信任度）
+            if referer:
+                page.get(referer)
+                time.sleep(1.5)
+
+            page.get(url)
+
+            # 等待 CF 挑战完成，最多 20 秒
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                html = page.html
+                if not any(kw in html for kw in
+                           ("Just a moment", "cf-browser-verification",
+                            "__cf_chl_", "challenge-running")):
+                    break
+                logger.debug("[drission] 等待 CF 挑战通过...")
+                time.sleep(1)
+
+            html = page.html
+            logger.info(f"[drission] 获取成功，页面长度: {len(html)}")
+            return html
+        finally:
+            try:
+                page.quit()
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.warning(f"[drission] 异常: {e}")
+        return None
+
+
 # ─── Level 1: curl_cffi（TLS 指纹模拟） ──────────────────────────────────────
 
 def _fetch_with_curl_cffi(url: str, referer: str = "") -> Optional[str]:
-    """
-    使用 curl_cffi 模拟 Chrome 120 的 TLS 握手特征。
-    这能绕过 Cloudflare 的 JA3/JA4 指纹检测（最有效方案）。
-    安装：pip install curl_cffi
-    """
+    """模拟 Chrome 120 TLS 握手特征，绕过 JA3/JA4 指纹检测。"""
     try:
         from curl_cffi import requests as cffi_req
+    except ImportError:
+        logger.debug("[curl_cffi] 未安装，跳过 (pip install curl_cffi)")
+        return None
 
-        headers = {**HEADERS}
-        if referer:
-            headers["Referer"] = referer
+    headers = {**HEADERS}
+    if referer:
+        headers["Referer"] = referer
+    if PROXY:
+        logger.info(f"[curl_cffi] 使用代理: {PROXY}")
 
-        # curl_cffi 用 proxy= 字符串（None 表示不使用代理）
-        if PROXY:
-            logger.info(f"[curl_cffi] 使用代理: {PROXY}")
+    try:
         resp = cffi_req.get(
             url,
             headers=headers,
             impersonate="chrome120",
             timeout=TIMEOUT,
             allow_redirects=True,
-            proxy=PROXY,
+            proxy=PROXY,        # curl_cffi 用 proxy= 字符串，None 表示不使用
         )
-
         if resp.status_code == 200:
             logger.info(f"[curl_cffi] 成功 (HTTP 200): {url}")
             return resp.text
-        else:
-            logger.warning(f"[curl_cffi] HTTP {resp.status_code}")
-            return None
-
-    except ImportError:
-        logger.debug("[curl_cffi] 未安装，跳过 (pip install curl_cffi)")
+        logger.warning(f"[curl_cffi] HTTP {resp.status_code}")
         return None
     except Exception as e:
         logger.warning(f"[curl_cffi] 异常: {e}")
         return None
 
 
-# ─── Level 2: cloudscraper（JS 挑战执行） ────────────────────────────────────
+# ─── Level 2: cloudscraper（旧版 CF JS 挑战） ────────────────────────────────
 
 def _fetch_with_cloudscraper(url: str, referer: str = "") -> Optional[str]:
-    """
-    使用 cloudscraper 自动执行 Cloudflare 的 JS 挑战（IUAM 模式）。
-    安装：pip install cloudscraper
-    """
+    """执行 Cloudflare IUAM 模式的 JS 挑战（适合旧版 CF 防护）。"""
     try:
         import cloudscraper
+    except ImportError:
+        logger.debug("[cloudscraper] 未安装，跳过 (pip install cloudscraper)")
+        return None
 
+    try:
         scraper = cloudscraper.create_scraper(
-            browser={
-                "browser": "chrome",
-                "platform": "windows",
-                "mobile": False,
-            },
+            browser={"browser": "chrome", "platform": "windows", "mobile": False},
             delay=5,
         )
-
         if referer:
             scraper.headers.update({"Referer": referer})
-
         if PROXY:
             logger.info(f"[cloudscraper] 使用代理: {PROXY}")
         proxies = {"http": PROXY, "https": PROXY} if PROXY else None
         resp = scraper.get(url, timeout=TIMEOUT, proxies=proxies)
-
         if resp.status_code == 200:
             logger.info(f"[cloudscraper] 成功 (HTTP 200): {url}")
             return resp.text
-        else:
-            logger.warning(f"[cloudscraper] HTTP {resp.status_code}")
-            return None
-
-    except ImportError:
-        logger.debug("[cloudscraper] 未安装，跳过 (pip install cloudscraper)")
+        logger.warning(f"[cloudscraper] HTTP {resp.status_code}")
         return None
     except Exception as e:
         logger.warning(f"[cloudscraper] 异常: {e}")
@@ -115,14 +179,12 @@ def _fetch_with_cloudscraper(url: str, referer: str = "") -> Optional[str]:
 # ─── Level 3: requests（普通浏览器头，兜底） ─────────────────────────────────
 
 def _make_session(referer: str = "") -> requests.Session:
-    """构建带持久 cookie 的 Session，模拟正常浏览行为"""
     session = requests.Session()
     session.headers.update(HEADERS)
     if referer:
         session.headers.update({"Referer": referer})
     if PROXY:
         session.proxies.update({"http": PROXY, "https": PROXY})
-    # 先访问首页热身，获取基础 cookie
     try:
         session.get("https://supjav.com/", timeout=TIMEOUT)
         time.sleep(1.0)
@@ -132,9 +194,7 @@ def _make_session(referer: str = "") -> requests.Session:
 
 
 def _fetch_with_requests(url: str, referer: str = "") -> Optional[str]:
-    """普通 requests 重试，作为最终兜底"""
     session = _make_session(referer)
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = session.get(url, timeout=TIMEOUT)
@@ -149,66 +209,41 @@ def _fetch_with_requests(url: str, referer: str = "") -> Optional[str]:
             logger.warning(f"[requests] 请求异常: {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(2 ** attempt)
-
     return None
 
 
 # ─── 统一入口 ────────────────────────────────────────────────────────────────
 
-def check_proxy() -> bool:
-    """
-    代理连通性自检：用 requests 通过代理访问一个简单的测试地址。
-    返回 True 表示代理正常，False 表示代理不可用。
-    """
-    if not PROXY:
-        return False
-    test_url = "https://httpbin.org/ip"
-    try:
-        resp = requests.get(
-            test_url,
-            proxies={"http": PROXY, "https": PROXY},
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            logger.info(f"[proxy] 连通性正常，出口 IP: {data.get('origin', '?')}")
-            return True
-        logger.warning(f"[proxy] 测试返回 HTTP {resp.status_code}")
-    except Exception as e:
-        logger.warning(f"[proxy] 连通性测试失败: {e}")
-    return False
-
-
 def fetch_page(url: str, session=None) -> str:
     """
-    获取页面 HTML，依次尝试三种方案：
-      1. curl_cffi  →  TLS 指纹模拟（绕过 Cloudflare Bot Management）
-      2. cloudscraper  →  JS 挑战执行（绕过 CF IUAM 模式）
-      3. requests  →  普通浏览器头重试
-    全部失败则抛出 RuntimeError。
+    依次尝试四个级别获取页面 HTML，全部失败则抛出 RuntimeError。
     """
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
 
     if PROXY:
-        print(f"    代理已配置: {PROXY}")
-        ok = check_proxy()
-        if not ok:
-            print(f"    ⚠ 代理连通性测试失败，请检查代理软件是否正在运行")
+        print(f"    代理已配置: {PROXY}", flush=True)
+        if check_proxy():
+            print(f"    ✓ 代理端口连通正常", flush=True)
         else:
-            print(f"    ✓ 代理连通正常")
+            print(f"    ⚠ 代理端口不可达，请确认代理软件正在运行", flush=True)
 
-    print("    尝试 Level 1: curl_cffi (TLS 指纹模拟)...")
+    print("    尝试 Level 0: DrissionPage (真实 Chrome，CF JS 挑战)...", flush=True)
+    html = _fetch_with_drissionpage(url, referer)
+    if html and _is_real_page(html):
+        return html
+
+    print("    尝试 Level 1: curl_cffi (TLS 指纹模拟)...", flush=True)
     html = _fetch_with_curl_cffi(url, referer)
     if html and _is_real_page(html):
         return html
 
-    print("    尝试 Level 2: cloudscraper (JS 挑战)...")
+    print("    尝试 Level 2: cloudscraper (旧版 CF JS 挑战)...", flush=True)
     html = _fetch_with_cloudscraper(url, referer)
     if html and _is_real_page(html):
         return html
 
-    print("    尝试 Level 3: requests (普通浏览器头)...")
+    print("    尝试 Level 3: requests (普通浏览器头)...", flush=True)
     html = _fetch_with_requests(url, referer)
     if html and _is_real_page(html):
         return html
@@ -217,9 +252,7 @@ def fetch_page(url: str, session=None) -> str:
 
 
 def _is_real_page(html: str) -> bool:
-    """
-    检测获取到的页面是否是真实内容（而非 CF 挑战/错误页）。
-    """
+    """检测页面是否是真实内容（排除 CF 挑战页）。"""
     if not html or len(html) < 500:
         return False
     cf_blocks = [
@@ -233,7 +266,7 @@ def _is_real_page(html: str) -> bool:
     ]
     for indicator in cf_blocks:
         if indicator in html:
-            logger.warning(f"[_is_real_page] 检测到 Cloudflare 挑战页: {indicator!r}")
+            logger.warning(f"[_is_real_page] 仍是 CF 挑战页: {indicator!r}")
             return False
     return True
 
@@ -252,15 +285,7 @@ def _extract_iframes(soup: BeautifulSoup, base_url: str) -> list[str]:
 
 
 def _extract_from_scripts(html: str, base_url: str) -> list[str]:
-    """
-    从 <script> 标签中提取视频 URL。
-    supjav 常见模式：
-      - var player_url = "https://..."
-      - sources: [{file: "..."}]
-      - post_id / video_id → AJAX 请求
-    """
     results = []
-
     patterns = [
         r'(?:player_url|embed_url|video_url|src)\s*[=:]\s*["\']([^"\']+)["\']',
         r'"(?:file|src|source|url|link)"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4|flv)[^"]*)"',
@@ -274,14 +299,11 @@ def _extract_from_scripts(html: str, base_url: str) -> list[str]:
         ])
         + r')[^"\'<>\s]+)',
     ]
-
     for pat in patterns:
         for m in re.finditer(pat, html, re.IGNORECASE):
             u = m.group(1).strip()
             if u and u.startswith("http"):
                 results.append(u)
-
-    # 内联 JSON 块
     for block in re.findall(r'\{[^{}]{5,300}?"(?:url|src|file|embed)"[^{}]{0,300}?\}', html):
         try:
             data = json.loads(block)
@@ -292,7 +314,6 @@ def _extract_from_scripts(html: str, base_url: str) -> list[str]:
                         results.append(u)
         except json.JSONDecodeError:
             pass
-
     return results
 
 
@@ -321,10 +342,6 @@ def _extract_m3u8_direct(html: str) -> list[str]:
 
 
 def _extract_server_links(soup: BeautifulSoup, base_url: str) -> list[str]:
-    """
-    supjav 多服务器按钮：
-    <a class="server active" data-url="https://doodstream.com/e/...">Server 1</a>
-    """
     results = []
     for tag in soup.find_all(True, attrs={"class": re.compile(r"server|mirror|source|player", re.I)}):
         for attr in ("data-url", "data-src", "data-embed", "href"):
@@ -339,7 +356,6 @@ def extract_embed_urls(html: str, page_url: str) -> list[str]:
     soup = BeautifulSoup(html, "lxml")
     seen: set[str] = set()
     results: list[str] = []
-
     sources = (
         _extract_iframes(soup, page_url)
         + _extract_from_scripts(html, page_url)
@@ -348,13 +364,11 @@ def extract_embed_urls(html: str, page_url: str) -> list[str]:
         + _extract_m3u8_direct(html)
         + _extract_server_links(soup, page_url)
     )
-
     for url in sources:
         url = url.strip().rstrip("/")
         if url and url not in seen:
             seen.add(url)
             results.append(url)
-
     logger.info(f"[extract_embed_urls] 共发现 {len(results)} 个候选 URL")
     return results
 

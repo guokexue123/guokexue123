@@ -16,10 +16,8 @@ import logging
 from page_parser import fetch_page, extract_embed_urls, get_page_title
 from extractors import get_extractor
 from downloader import download_with_ytdlp, download_direct
-from config import (
-    DOWNLOAD_DIR, SUPPORTED_HOSTS,
-    SERVER_PREF, SERVER_HOSTS, LOCAL_HTML_FILE,
-)
+import config
+from config import DOWNLOAD_DIR, SUPPORTED_HOSTS
 
 # ── 目标 URL（直接修改这里） ───────────────────────────────────────────────
 TARGET_URL = "https://supjav.com/zh/132824.html"
@@ -40,15 +38,13 @@ def _is_supported_host(url: str) -> bool:
 
 
 def _matches_pref(url: str, pref: str) -> bool:
-    """判断 URL 是否属于指定服务器偏好"""
     if not pref:
         return True
-    keywords = SERVER_HOSTS.get(pref.upper(), [])
+    keywords = config.SERVER_HOSTS.get(pref.upper(), [])
     return any(kw in url.lower() for kw in keywords)
 
 
 def _sort_by_pref(urls: list[str], pref: str) -> list[str]:
-    """将偏好服务器的 URL 排到最前面"""
     if not pref:
         return urls
     preferred = [u for u in urls if _matches_pref(u, pref)]
@@ -111,13 +107,13 @@ def screenshot_at_10s(video_path: str) -> str | None:
 
 def _load_html(url: str) -> str:
     """
-    获取页面 HTML。
-    若 LOCAL_HTML_FILE 已设置且文件存在，直接读取本地文件（跳过网络请求）。
-    否则走三级网络抓取（curl_cffi → cloudscraper → requests）。
+    获取页面 HTML。运行时读取 config.LOCAL_HTML_FILE，
+    保证用户修改 config.py 后无需重新导入即可生效。
     """
-    if LOCAL_HTML_FILE and os.path.exists(LOCAL_HTML_FILE):
-        print(f"  [本地模式] 读取: {LOCAL_HTML_FILE}")
-        with open(LOCAL_HTML_FILE, encoding="utf-8", errors="replace") as f:
+    local = config.LOCAL_HTML_FILE
+    if local and os.path.exists(local):
+        print(f"  [本地模式] 读取: {local}")
+        with open(local, encoding="utf-8", errors="replace") as f:
             return f.read()
     return fetch_page(url)
 
@@ -128,7 +124,7 @@ def run(url: str, output_dir: str = DOWNLOAD_DIR, debug: bool = False) -> bool:
 
     os.makedirs(output_dir, exist_ok=True)
 
-    pref_label = f"偏好服务器: {SERVER_PREF}" if SERVER_PREF else "偏好服务器: 全部"
+    pref_label = f"偏好服务器: {config.SERVER_PREF}" if config.SERVER_PREF else "偏好服务器: 全部"
     print(f"\n{'='*60}")
     print(f"  目标页面: {url}")
     print(f"  下载目录: {output_dir}")
@@ -158,14 +154,14 @@ def run(url: str, output_dir: str = DOWNLOAD_DIR, debug: bool = False) -> bool:
     # 已知平台优先，再按 SERVER_PREF 排序
     known = [u for u in embed_urls if _is_supported_host(u)]
     others = [u for u in embed_urls if not _is_supported_host(u)]
-    ordered = _sort_by_pref(known, SERVER_PREF) + others
+    ordered = _sort_by_pref(known, config.SERVER_PREF) + others
 
     print(f"  发现 {len(ordered)} 个候选源")
-    if SERVER_PREF:
-        pref_count = sum(1 for u in ordered if _matches_pref(u, SERVER_PREF))
-        print(f"  其中 {pref_count} 个匹配偏好 [{SERVER_PREF}]")
+    if config.SERVER_PREF:
+        pref_count = sum(1 for u in ordered if _matches_pref(u, config.SERVER_PREF))
+        print(f"  其中 {pref_count} 个匹配偏好 [{config.SERVER_PREF}]")
     for i, u in enumerate(ordered, 1):
-        tag = f" ← [{SERVER_PREF}]" if _matches_pref(u, SERVER_PREF) and SERVER_PREF else ""
+        tag = f" ← [{config.SERVER_PREF}]" if _matches_pref(u, config.SERVER_PREF) and config.SERVER_PREF else ""
         print(f"    [{i}] {u}{tag}")
 
     # ── Step 3 & 4: 逐一尝试下载 ─────────────────────────────────────────
