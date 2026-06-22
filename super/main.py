@@ -20,7 +20,7 @@ import config
 from config import DOWNLOAD_DIR, SUPPORTED_HOSTS
 
 # ── 目标 URL（直接修改这里） ───────────────────────────────────────────────
-TARGET_URL = "https://supjav.com/zh/132824.html"
+TARGET_URL = "https://123av.com/en/v/dvdes-861"
 # ──────────────────────────────────────────────────────────────────────────
 
 
