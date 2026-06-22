@@ -11,6 +11,23 @@ import os
 #   PROXY = None                            # 不使用代理
 PROXY = None
 
+# ── 服务器偏好（优先选择哪个视频托管服务） ────────────────────────────────
+# 可选值：
+#   "DS"  → DoodStream（推荐，速度快）
+#   "ST"  → Streamtape
+#   "MD"  → Mixdrop
+#   "FM"  → Filemoon
+#   ""    → 不过滤，按页面顺序尝试所有服务器
+SERVER_PREF = "DS"
+
+# ── 本地 HTML 注入（跳过网络请求，直接解析本地保存的页面） ────────────────
+# 使用方法：
+#   1. 用浏览器打开目标 URL（如 https://supjav.com/zh/132824.html）
+#   2. Ctrl+S 另存为"网页，仅 HTML"（.html 文件）
+#   3. 把路径填到下面，脚本会直接解析本地文件，无需联网
+# 不需要时设置为 None
+LOCAL_HTML_FILE = None
+
 # ── 请求头：模拟 Chrome 120 浏览器 ──────────────────────────────────────
 HEADERS = {
     "User-Agent": (
@@ -41,6 +58,14 @@ MAX_RETRIES = 3
 
 # ── yt-dlp 下载质量偏好（按优先级） ─────────────────────────────────────
 YDL_FORMAT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+
+# ── 服务器简称 → 域名关键词映射 ──────────────────────────────────────────
+SERVER_HOSTS: dict[str, list[str]] = {
+    "DS": ["doodstream", "dood."],
+    "ST": ["streamtape"],
+    "MD": ["mixdrop"],
+    "FM": ["filemoon"],
+}
 
 # ── 支持的视频托管平台（supjav 常用） ────────────────────────────────────
 SUPPORTED_HOSTS = [
