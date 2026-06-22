@@ -140,42 +140,6 @@ def extract_urls_from_aweme_json(data) -> list[str]:
     return urls
 
 
-def probe_url_size(url: str, cookie_header: str = "") -> int:
-    """HEAD 请求探测 URL 指向的文件大小（字节），失败返回 0"""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://www.douyin.com/",
-    }
-    if cookie_header:
-        headers["Cookie"] = cookie_header
-    try:
-        r = requests.head(url, headers=headers, timeout=10, allow_redirects=True)
-        return int(r.headers.get("content-length", 0))
-    except Exception:
-        return 0
-
-
-def pick_largest_url(urls: list[str], cookie_header: str = "") -> str:
-    """
-    对每个候选 URL 发 HEAD 请求探测文件大小，返回最大文件对应的 URL。
-    核心用途：从多个 CDN URL 中区分 ~455KB 预览片段和数十 MB 的完整视频。
-    """
-    unique = list(dict.fromkeys(urls))  # 去重保序
-    if len(unique) == 1:
-        return unique[0]
-
-    best_url, best_size = unique[0], 0
-    for url in unique:
-        size = probe_url_size(url, cookie_header)
-        print(f"  ℹ 大小探测: {size / 1024 / 1024:.2f} MB ← {url[:80]}")
-        if size > best_size:
-            best_size, best_url = size, url
-
-    print(f"  ✓ 选择最大文件: {best_size / 1024 / 1024:.2f} MB")
-    return best_url
 
 
 async def extract_from_page_state(page) -> list[str]:
@@ -391,31 +355,30 @@ async def get_video_url():
         )
         print(f"  ✓ 已提取 {len(all_cookies)} 个会话 Cookie")
 
-        # 优先使用 API 响应中解析的 URL（质量最好，通常无水印）
+        # 优先使用 API/SSR 解析的 URL（url_list 里多个是同一视频的 CDN 镜像，取全部备用）
         if video_urls_from_api:
-            print(f"\n  ✓ API 响应提取到 {len(video_urls_from_api)} 个视频URL")
+            unique_api = list(dict.fromkeys(video_urls_from_api))
+            print(f"\n  ✓ SSR/API 提取到 {len(unique_api)} 个候选视频URL")
             await browser.close()
-            return video_urls_from_api[0], session_cookie_header
+            return unique_api, session_cookie_header
 
-        # 其次使用播放后捕获的 CDN URL
-        # 注意：多个 URL 中第一个可能仍是预览片段，必须用 HEAD 探测大小后选最大的
+        # 其次使用播放后捕获的 CDN URL（下载全部，可能是视频分段）
         if cdn_after_play:
-            print(f"\n  ▶ 播放后捕获 {len(cdn_after_play)} 个 CDN URL，探测大小选最优...")
-            best = pick_largest_url(cdn_after_play, session_cookie_header)
+            unique_cdn = list(dict.fromkeys(cdn_after_play))
+            print(f"\n  ✓ 播放后 CDN 捕获 {len(unique_cdn)} 个唯一URL（全部下载）")
             await browser.close()
-            return best, session_cookie_header
+            return unique_cdn, session_cookie_header
 
         if cdn_before_play:
-            print(f"\n  ⚠ 只有播放前预览 URL（{len(cdn_before_play)} 个），探测大小选最优...")
-            best = pick_largest_url(cdn_before_play, session_cookie_header)
+            unique_cdn = list(dict.fromkeys(cdn_before_play))
+            print(f"\n  ⚠ 只有播放前 CDN URL（{len(unique_cdn)} 个），全部下载")
             await browser.close()
-            return best, session_cookie_header
+            return unique_cdn, session_cookie_header
 
         # 策略3: 在页面内直接 fetch 抖音 API（兜底，依赖浏览器 Cookie 自动携带签名）
         aweme_id = extract_aweme_id(TARGET_URL)
         if aweme_id:
             print(f"  ▶ 兜底：页面内 fetch API，aweme_id={aweme_id}")
-            # 同时尝试 web detail 端点和 feed 端点
             for api_url in [
                 f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={aweme_id}&device_platform=webapp&aid=6383",
                 f"https://www.douyin.com/aweme/v1/feed/?aweme_id={aweme_id}&version_code=170400&app_name=douyin_web",
@@ -441,7 +404,7 @@ async def get_video_url():
                         if urls:
                             print(f"  ✓ 页面内 API 提取到 {len(urls)} 个视频URL")
                             await browser.close()
-                            return urls[0], session_cookie_header
+                            return list(dict.fromkeys(urls)), session_cookie_header
                 except Exception as e:
                     print(f"  ⚠ 页面内 API 查询失败 ({api_url[:60]}): {e}")
 
@@ -453,7 +416,7 @@ async def get_video_url():
             print(f"  frame[{i}] url={frame.url}")
 
         await browser.close()
-        return None, session_cookie_header
+        return [], session_cookie_header
 
 
 # ==================== 下载 ====================
@@ -515,32 +478,88 @@ def download_via_ffmpeg(url: str, output: Path, ffmpeg_bin: str, cookie_header: 
     return result.returncode == 0
 
 
-def download_video(video_url: str, output_name: str, cookie_header: str = "") -> Path:
+def download_all_and_merge(video_urls: list[str], output_name: str, cookie_header: str = "") -> Path:
     """
-    下载视频。
-    优先用 ffmpeg（同时支持 m3u8 和 MP4 直链）；
-    ffmpeg 不可用时直接 HTTP 流式下载 MP4。
-    """
-    is_m3u8 = ".m3u8" in video_url
-    # 从 URL 路径推断扩展名，默认 mp4
-    url_path = video_url.split("?")[0]
-    suffix = url_path.rsplit(".", 1)[-1] if "." in url_path.rsplit("/", 1)[-1] else "mp4"
-    ext = "mp4" if is_m3u8 else suffix
-    output = OUTPUT_DIR / f"{output_name}.{ext}"
+    下载所有候选 URL（每个存为独立 part 文件），然后尝试用 ffmpeg concat 合并。
 
+    场景一：URL 列表是同一视频的多个 CDN 镜像（SSR/API 来源）
+      → 逐个尝试，第一个成功即停止，重命名为最终文件
+    场景二：URL 列表是视频分段（CDN 请求拦截来源）
+      → 全部下载后合并
+    两种场景在下载后通过文件数量自动区分。
+    """
     ffmpeg_bin = _resolve_ffmpeg()
-    if ffmpeg_bin:
-        print(f"  ✓ 使用 ffmpeg: {ffmpeg_bin}")
-        if download_via_ffmpeg(video_url, output, ffmpeg_bin, cookie_header):
-            return output
-        print("  ✗ ffmpeg 下载失败，尝试直接 HTTP 下载...")
+    unique_urls = list(dict.fromkeys(video_urls))
+    multi = len(unique_urls) > 1
 
-    if is_m3u8:
-        print("  ✗ m3u8 流需要 ffmpeg，请安装: winget install ffmpeg  或  brew install ffmpeg")
-    else:
-        download_mp4_direct(video_url, output, cookie_header)
+    downloaded: list[Path] = []
 
-    return output
+    for i, url in enumerate(unique_urls):
+        label = f"part{i+1:02d}" if multi else "main"
+        output = OUTPUT_DIR / f"{output_name}_{label}.mp4"
+
+        print(f"\n  ▶ [{i+1}/{len(unique_urls)}] {url[:90]}")
+
+        ok = False
+        if ffmpeg_bin:
+            ok = download_via_ffmpeg(url, output, ffmpeg_bin, cookie_header)
+        if not ok:
+            ok = download_mp4_direct(url, output, cookie_header)
+
+        if ok and output.exists() and output.stat().st_size > 0:
+            size_mb = output.stat().st_size / 1024 / 1024
+            print(f"  ✓ {output.name}  {size_mb:.2f} MB")
+            downloaded.append(output)
+        else:
+            if output.exists():
+                output.unlink(missing_ok=True)
+
+    if not downloaded:
+        print("  ✗ 所有 URL 下载均失败")
+        return OUTPUT_DIR / f"{output_name}.mp4"
+
+    # 只有一个文件：直接重命名为 {name}.mp4
+    if len(downloaded) == 1:
+        final = OUTPUT_DIR / f"{output_name}.mp4"
+        shutil.move(str(downloaded[0]), final)
+        print(f"\n  完成: {final}")
+        return final
+
+    # 多个文件：列出大小摘要
+    print(f"\n  ℹ 共下载 {len(downloaded)} 个文件:")
+    for f in downloaded:
+        print(f"    {f.name}: {f.stat().st_size / 1024 / 1024:.2f} MB")
+
+    if not ffmpeg_bin:
+        print("  ⚠ 未找到 ffmpeg，无法合并。请安装后手动执行:")
+        print(f'    ffmpeg -f concat -safe 0 -i list.txt -c copy {output_name}.mp4')
+        return max(downloaded, key=lambda f: f.stat().st_size)
+
+    # ffmpeg concat 合并
+    merged = OUTPUT_DIR / f"{output_name}.mp4"
+    concat_txt = OUTPUT_DIR / "_concat_list.txt"
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        for seg in downloaded:
+            f.write(f"file '{seg.resolve()}'\n")
+
+    print(f"\n  ▶ ffmpeg 合并 {len(downloaded)} 个文件 → {merged.name}")
+    result = subprocess.run([
+        ffmpeg_bin, "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(concat_txt),
+        "-c", "copy",
+        str(merged),
+    ])
+    concat_txt.unlink(missing_ok=True)
+
+    if result.returncode == 0 and merged.exists():
+        size_mb = merged.stat().st_size / 1024 / 1024
+        print(f"  ✓ 合并成功: {merged.name}  {size_mb:.2f} MB")
+        print("  ℹ 分段文件已保留，确认合并正常后可手动删除")
+        return merged
+
+    print("  ⚠ 合并失败（可能是独立质量版本而非分段），分段文件保留在 downloads/")
+    return max(downloaded, key=lambda f: f.stat().st_size)
 
 
 # ==================== 主程序 ====================
@@ -550,9 +569,9 @@ async def main():
     print("  抖音视频下载器 v2")
     print("=" * 60)
 
-    video_url, cookie_header = await get_video_url()
+    video_urls, cookie_header = await get_video_url()
 
-    if not video_url:
+    if not video_urls:
         print("\n  ✗ 无法提取视频 URL")
         print("  建议：")
         print("  1. 设置 HEADLESS=False 手动通过验证")
@@ -560,13 +579,15 @@ async def main():
         print("  3. 查看 downloads/debug_screenshot.png 截图")
         return
 
-    print(f"\n  ✓ 视频 URL: {video_url[:120]}")
+    print(f"\n  ✓ 共 {len(video_urls)} 个候选URL，逐一下载并尝试合并")
+    for i, u in enumerate(video_urls):
+        print(f"    [{i+1}] {u[:100]}")
 
     aweme_id = extract_aweme_id(TARGET_URL)
     video_name = sanitize_filename(aweme_id or TARGET_URL.rstrip("/").split("/")[-1])
-    print(f"  ✓ 输出文件名: {video_name}")
+    print(f"  ✓ 输出文件名前缀: {video_name}")
 
-    output = download_video(video_url, video_name, cookie_header)
+    output = download_all_and_merge(video_urls, video_name, cookie_header)
     print(f"\n  完成: {output}")
 
 
