@@ -140,6 +140,87 @@ def extract_urls_from_aweme_json(data) -> list[str]:
     return urls
 
 
+def probe_url_size(url: str, cookie_header: str = "") -> int:
+    """HEAD 请求探测 URL 指向的文件大小（字节），失败返回 0"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.douyin.com/",
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    try:
+        r = requests.head(url, headers=headers, timeout=10, allow_redirects=True)
+        return int(r.headers.get("content-length", 0))
+    except Exception:
+        return 0
+
+
+def pick_largest_url(urls: list[str], cookie_header: str = "") -> str:
+    """
+    对每个候选 URL 发 HEAD 请求探测文件大小，返回最大文件对应的 URL。
+    核心用途：从多个 CDN URL 中区分 ~455KB 预览片段和数十 MB 的完整视频。
+    """
+    unique = list(dict.fromkeys(urls))  # 去重保序
+    if len(unique) == 1:
+        return unique[0]
+
+    best_url, best_size = unique[0], 0
+    for url in unique:
+        size = probe_url_size(url, cookie_header)
+        print(f"  ℹ 大小探测: {size / 1024 / 1024:.2f} MB ← {url[:80]}")
+        if size > best_size:
+            best_size, best_url = size, url
+
+    print(f"  ✓ 选择最大文件: {best_size / 1024 / 1024:.2f} MB")
+    return best_url
+
+
+async def extract_from_page_state(page) -> list[str]:
+    """
+    从抖音页面内嵌的 SSR 数据中提取视频 URL。
+    抖音 web 端将初始数据放在 <script id="RENDER_DATA"> 标签内（URL 编码的 JSON）。
+    这是比 API 响应拦截更可靠的方法，因为数据已经在 DOM 里。
+    """
+    # 方法1: #RENDER_DATA script 标签（主要 SSR 数据入口）
+    try:
+        text = await page.evaluate("""
+            () => {
+                const el = document.querySelector('#RENDER_DATA');
+                if (!el) return null;
+                try { return decodeURIComponent(el.textContent); }
+                catch(e) { return el.textContent; }
+            }
+        """)
+        if text:
+            data = json.loads(text)
+            urls = extract_urls_from_aweme_json(data)
+            if urls:
+                print(f"  ✓ [RENDER_DATA] 提取到 {len(urls)} 个视频URL")
+                return urls
+    except Exception:
+        pass
+
+    # 方法2: window.__INITIAL_STATE__ 全局变量
+    try:
+        state_text = await page.evaluate(
+            "() => { try { return JSON.stringify(window.__INITIAL_STATE__); } "
+            "catch(e) { return null; } }"
+        )
+        if state_text and state_text != "null":
+            data = json.loads(state_text)
+            urls = extract_urls_from_aweme_json(data)
+            if urls:
+                print(f"  ✓ [__INITIAL_STATE__] 提取到 {len(urls)} 个视频URL")
+                return urls
+    except Exception:
+        pass
+
+    return []
+
+
 async def wait_for_verification(page, timeout=90):
     """
     等待验证通过。
@@ -273,6 +354,12 @@ async def get_video_url():
         await wait_for_verification(page, timeout=90)
         await asyncio.sleep(3)
 
+        # 优先从页面 SSR 数据提取（数据已在 DOM，无需拦截 API 响应）
+        print("  ▶ 从页面 SSR 数据提取视频 URL...")
+        ssr_urls = await extract_from_page_state(page)
+        if ssr_urls:
+            video_urls_from_api.extend(ssr_urls)
+
         # 触发视频播放，让浏览器发出完整视频的 CDN 请求
         print("  ▶ 触发视频播放...")
         play_triggered = True
@@ -310,16 +397,19 @@ async def get_video_url():
             await browser.close()
             return video_urls_from_api[0], session_cookie_header
 
-        # 其次使用播放后捕获的 CDN URL（完整视频），忽略播放前的预览片段
+        # 其次使用播放后捕获的 CDN URL
+        # 注意：多个 URL 中第一个可能仍是预览片段，必须用 HEAD 探测大小后选最大的
         if cdn_after_play:
-            print(f"\n  ✓ 播放后 CDN 捕获到 {len(cdn_after_play)} 个视频URL（完整视频）")
+            print(f"\n  ▶ 播放后捕获 {len(cdn_after_play)} 个 CDN URL，探测大小选最优...")
+            best = pick_largest_url(cdn_after_play, session_cookie_header)
             await browser.close()
-            return cdn_after_play[0], session_cookie_header
+            return best, session_cookie_header
 
         if cdn_before_play:
-            print(f"\n  ⚠ 只捕获到播放前的预览 URL（可能仅为片段），共 {len(cdn_before_play)} 个")
+            print(f"\n  ⚠ 只有播放前预览 URL（{len(cdn_before_play)} 个），探测大小选最优...")
+            best = pick_largest_url(cdn_before_play, session_cookie_header)
             await browser.close()
-            return cdn_before_play[0], session_cookie_header
+            return best, session_cookie_header
 
         # 策略3: 在页面内直接 fetch 抖音 API（兜底，依赖浏览器 Cookie 自动携带签名）
         aweme_id = extract_aweme_id(TARGET_URL)
