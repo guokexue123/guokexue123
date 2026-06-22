@@ -29,8 +29,6 @@ except ImportError:
 # ==================== 配置区 ====================
 TARGET_URL = "https://18av.mm-cg.com/zh/chinese_content/8381/SUN-020.html"
 
-
-
 # 直接粘贴你的 Cookie 字符串（从浏览器 DevTools → Network → 请求头复制）
 # 格式: "key1=val1; key2=val2; ..."
 COOKIE_STRING = ""  # ← 填入你的 cookie
@@ -43,6 +41,9 @@ CONCURRENT_DOWNLOADS = 16
 
 # 是否使用有头浏览器（True=显示窗口，更容易过CF；False=无头）
 HEADLESS = False
+
+# ffmpeg 可执行文件路径（留空 "" 则自动从系统 PATH 查找）
+FFMPEG_PATH = r"D:\Tool\ffmpeg\bin\ffmpeg"
 # ================================================
 
 
@@ -411,6 +412,7 @@ def download_hls(m3u8_url: str, output_name: str):
     print(f"\n  ▶ 合并分片 → {mp4_path}")
 
     # 优先用 ffmpeg
+    ffmpeg_bin = FFMPEG_PATH if FFMPEG_PATH and Path(FFMPEG_PATH).exists() else "ffmpeg"
     ffmpeg_ok = False
     try:
         list_file = tmp_dir / "filelist.txt"
@@ -421,7 +423,7 @@ def download_hls(m3u8_url: str, output_name: str):
                     f.write(f"file '{seg.resolve()}'\n")
 
         subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
             "-i", str(list_file),
             "-c", "copy",
             "-bsf:a", "aac_adtstoasc",   # ADTS → LATM，mp4 容器必需
@@ -431,8 +433,8 @@ def download_hls(m3u8_url: str, output_name: str):
         ffmpeg_ok = True
         output_path = mp4_path
     except FileNotFoundError:
-        print("  ⚠ 未找到 ffmpeg，使用二进制拼接")
-        print("    安装方法: apt install ffmpeg  /  winget install ffmpeg")
+        print(f"  ⚠ 未找到 ffmpeg（路径: {ffmpeg_bin}），使用二进制拼接")
+        print("    请检查 FFMPEG_PATH 配置，或安装 ffmpeg")
     except subprocess.CalledProcessError as e:
         print(f"  ⚠ ffmpeg 执行失败，使用二进制拼接")
         print(f"    ffmpeg stderr: {e.stderr.decode(errors='replace')[-300:]}")
