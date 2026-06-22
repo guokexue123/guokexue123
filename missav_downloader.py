@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import subprocess
@@ -311,8 +312,49 @@ async def get_m3u8_url():
 
 # ==================== HLS 下载 ====================
 
-def fetch_m3u8_segments(m3u8_url: str, headers: dict) -> tuple[list[str], str]:
-    """解析 m3u8，返回 (分片URL列表, 文件扩展名)"""
+def _resolve_ffmpeg() -> str | None:
+    """
+    查找 ffmpeg 可执行文件。
+    自动处理 Windows 下省略 .exe 扩展名的情况。
+    """
+    if FFMPEG_PATH:
+        for candidate in [FFMPEG_PATH, FFMPEG_PATH + ".exe"]:
+            if Path(candidate).exists():
+                return candidate
+        print(f"  ⚠ FFMPEG_PATH 路径不存在: {FFMPEG_PATH}")
+    return shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+
+
+def _ffmpeg_direct_download(m3u8_url: str, output: Path, ffmpeg_bin: str) -> bool:
+    """
+    ffmpeg 直接从 m3u8 URL 下载并封装为 mp4。
+    优势：自动处理 AES-128 加密、多级 m3u8、各种编码。
+    ffmpeg 进度直接输出到终端（无需隐藏）。
+    """
+    headers_arg = (
+        f"Referer: {TARGET_URL}\r\n"
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36\r\n"
+    )
+    print(f"  ▶ ffmpeg 下载（自动处理 AES 加密）: {output.name}")
+    result = subprocess.run([
+        ffmpeg_bin, "-y",
+        "-headers", headers_arg,
+        "-i", m3u8_url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        str(output),
+    ])  # 不捕获输出，ffmpeg 进度直接显示在终端
+    return result.returncode == 0
+
+
+def fetch_m3u8_segments(
+    m3u8_url: str, headers: dict
+) -> tuple[list[str], str, bytes | None, bytes | None]:
+    """
+    解析 m3u8，返回 (分片URL列表, 扩展名, AES密钥字节, IV字节)。
+    同时处理主播放列表（多码率）和 AES-128 加密。
+    """
     resp = requests.get(m3u8_url, headers=headers, timeout=15)
     resp.raise_for_status()
     content = resp.text
@@ -320,54 +362,121 @@ def fetch_m3u8_segments(m3u8_url: str, headers: dict) -> tuple[list[str], str]:
 
     lines = content.splitlines()
 
-    # 检查是否是主 m3u8（含多码率）
+    # 检查是否是主 m3u8（含多码率 #EXT-X-STREAM-INF）
     sub_m3u8 = None
     for line in lines:
-        line = line.strip()
-        if line and not line.startswith("#"):
-            if ".m3u8" in line:
-                sub_m3u8 = line if line.startswith("http") else urljoin(base_url, line)
-                break
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and ".m3u8" in stripped:
+            sub_m3u8 = stripped if stripped.startswith("http") else urljoin(base_url, stripped)
+            break
 
     if sub_m3u8:
         print(f"  ▶ 主 m3u8 → 选择最高码率: {sub_m3u8}")
         return fetch_m3u8_segments(sub_m3u8, headers)
 
-    # 提取分片
+    # 解析 AES-128 加密信息（#EXT-X-KEY）
+    key_bytes: bytes | None = None
+    iv_bytes:  bytes | None = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("#EXT-X-KEY"):
+            continue
+        m_method = re.search(r'METHOD=([^,\s]+)', stripped)
+        m_uri    = re.search(r'URI="([^"]+)"', stripped)
+        m_iv     = re.search(r'IV=0x([0-9a-fA-F]+)', stripped)
+        if m_method and m_method.group(1) == "AES-128" and m_uri:
+            key_url = m_uri.group(1)
+            if not key_url.startswith("http"):
+                key_url = urljoin(base_url, key_url)
+            key_bytes = requests.get(key_url, headers=headers, timeout=10).content
+            print(f"  ℹ 检测到 AES-128 加密，已下载密钥")
+            if m_iv:
+                iv_bytes = bytes.fromhex(m_iv.group(1).zfill(32))
+
+    # 提取分片 URL
     segments = []
     for line in lines:
-        line = line.strip()
-        if line and not line.startswith("#"):
-            seg_url = line if line.startswith("http") else urljoin(base_url, line)
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            seg_url = stripped if stripped.startswith("http") else urljoin(base_url, stripped)
             segments.append(seg_url)
 
     ext = ".ts"
     if segments and ".aac" in segments[0]:
         ext = ".aac"
 
-    return segments, ext
+    return segments, ext, key_bytes, iv_bytes
+
+
+def _aes_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-128-CBC 解密，优先用 pycryptodome，次选 cryptography。"""
+    try:
+        from Crypto.Cipher import AES
+        return AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+    except ImportError:
+        pass
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+        dec = Cipher(algorithms.AES(key), modes.CBC(iv),
+                     backend=default_backend()).decryptor()
+        return dec.update(data) + dec.finalize()
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "流已 AES-128 加密，需安装解密库:\n"
+        "  pip install pycryptodome\n"
+        "或  pip install cryptography"
+    )
 
 
 def download_segment(args):
-    """下载单个分片"""
-    idx, url, path, headers = args
+    """下载单个分片（支持 AES-128 解密）"""
+    idx, url, path, headers, key_bytes, iv_bytes = args
     if path.exists():
         return idx, True
 
     try:
         r = requests.get(url, headers=headers, timeout=20, stream=True)
         r.raise_for_status()
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(65536):
-                f.write(chunk)
+        data = b"".join(r.iter_content(65536))
+
+        if key_bytes:
+            # IV 未指定时使用分片序号（零填充到 16 字节）
+            iv = iv_bytes if iv_bytes else idx.to_bytes(16, "big")
+            data = _aes_decrypt(data, key_bytes, iv)
+
+        path.write_bytes(data)
         return idx, True
-    except Exception as e:
+    except Exception:
         return idx, False
 
 
-def download_hls(m3u8_url: str, output_name: str):
-    """并发下载 HLS 分片并合并"""
+def download_hls(m3u8_url: str, output_name: str) -> Path:
+    """
+    下载 HLS 流并输出 mp4。
+
+    策略：
+      1. ffmpeg 可用 → 直接从 m3u8 URL 下载（ffmpeg 自动处理 AES 加密）
+      2. ffmpeg 不可用 → Python 并发下载 + AES 解密 + 二进制拼接 → .ts
+    """
     import concurrent.futures
+
+    mp4_path = OUTPUT_DIR / f"{output_name}.mp4"
+    ffmpeg_bin = _resolve_ffmpeg()
+
+    # ── 路径1: ffmpeg 直接下载（推荐，自动处理 AES / 多级 m3u8）───────────────
+    if ffmpeg_bin:
+        print(f"\n  ▶ 合并分片 → {mp4_path}")
+        print(f"  ✓ 找到 ffmpeg: {ffmpeg_bin}")
+        if _ffmpeg_direct_download(m3u8_url, mp4_path, ffmpeg_bin):
+            return mp4_path
+        print("  ✗ ffmpeg 下载失败，切换到 Python 下载器...")
+
+    # ── 路径2: Python 并发下载 + AES 解密 + 二进制拼接 ───────────────────────
+    if not ffmpeg_bin:
+        print("  ⚠ 未找到 ffmpeg，使用 Python 下载器")
+        print("    安装 ffmpeg 可获得更好的兼容性: winget install ffmpeg")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -375,16 +484,15 @@ def download_hls(m3u8_url: str, output_name: str):
     }
 
     print(f"\n  ▶ 解析 m3u8: {m3u8_url[:80]}...")
-    segments, ext = fetch_m3u8_segments(m3u8_url, headers)
+    segments, ext, key_bytes, iv_bytes = fetch_m3u8_segments(m3u8_url, headers)
     total = len(segments)
     print(f"  ✓ 共 {total} 个分片，并发数: {CONCURRENT_DOWNLOADS}")
 
-    # 临时目录存分片
     tmp_dir = OUTPUT_DIR / f"{output_name}_segments"
     tmp_dir.mkdir(exist_ok=True)
 
     tasks = [
-        (i, url, tmp_dir / f"{i:05d}{ext}", headers)
+        (i, url, tmp_dir / f"{i:05d}{ext}", headers, key_bytes, iv_bytes)
         for i, url in enumerate(segments)
     ]
 
@@ -398,66 +506,26 @@ def download_hls(m3u8_url: str, output_name: str):
                     failed.append(idx)
                 pbar.update(1)
 
-    # 重试失败分片
     if failed:
         print(f"  ⚠ {len(failed)} 个分片失败，重试...")
-        retry_tasks = [tasks[i] for i in failed]
-        for t in retry_tasks:
+        for t in [tasks[i] for i in failed]:
             idx, ok = download_segment(t)
             if not ok:
                 print(f"  ✗ 分片 {idx} 最终失败")
 
-    # 合并
-    mp4_path = OUTPUT_DIR / f"{output_name}.mp4"
-    print(f"\n  ▶ 合并分片 → {mp4_path}")
+    # 二进制拼接输出 .ts（MPEG-TS 容器，不能命名为 .mp4）
+    ts_path = OUTPUT_DIR / f"{output_name}.ts"
+    print(f"\n  ▶ 合并分片 → {ts_path}")
+    with open(ts_path, "wb") as out:
+        for i in range(total):
+            seg = tmp_dir / f"{i:05d}{ext}"
+            if seg.exists():
+                out.write(seg.read_bytes())
+    print(f"  ✓ 合并完成（MPEG-TS）: {ts_path}")
+    print(f"  ℹ .ts 文件可用 VLC / mpv 直接播放")
+    print(f'    转 mp4: {ffmpeg_bin or "ffmpeg"} -i "{ts_path}" -c copy "{mp4_path}"')
+    output_path: Path = ts_path
 
-    # 优先用 ffmpeg
-    ffmpeg_bin = FFMPEG_PATH if FFMPEG_PATH and Path(FFMPEG_PATH).exists() else "ffmpeg"
-    ffmpeg_ok = False
-    try:
-        list_file = tmp_dir / "filelist.txt"
-        with open(list_file, "w", encoding="utf-8") as f:
-            for i in range(total):
-                seg = tmp_dir / f"{i:05d}{ext}"
-                if seg.exists():
-                    # as_posix() 将 Windows 反斜杠转为正斜杠，ffmpeg concat 必需
-                    f.write(f"file '{seg.resolve().as_posix()}'\n")
-
-        subprocess.run([
-            ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
-            "-i", str(list_file),
-            "-c", "copy",
-            "-bsf:a", "aac_adtstoasc",   # ADTS → LATM，mp4 容器必需
-            str(mp4_path),
-        ], check=True, capture_output=True)
-        print(f"  ✓ ffmpeg 合并完成: {mp4_path}")
-        ffmpeg_ok = True
-        output_path = mp4_path
-    except FileNotFoundError:
-        print(f"  ⚠ 未找到 ffmpeg（路径: {ffmpeg_bin}），使用二进制拼接")
-        print("    请检查 FFMPEG_PATH 配置，或安装 ffmpeg")
-    except subprocess.CalledProcessError as e:
-        print(f"  ⚠ ffmpeg 执行失败，使用二进制拼接")
-        print(f"    ffmpeg stderr: {e.stderr.decode(errors='replace')[-300:]}")
-
-    if not ffmpeg_ok:
-        # ── 修复：二进制拼接输出 .ts，而非 .mp4 ──────────────────────────────
-        # 分片二进制拼接后仍是 MPEG-TS 容器格式，绝不能命名为 .mp4。
-        # 以 .mp4 保存会导致容器与内容不符，绝大多数播放器拒绝播放。
-        # 正确做法：输出 .ts 文件，VLC / mpv / ffplay 均可直接播放。
-        ts_path = OUTPUT_DIR / f"{output_name}.ts"
-        with open(ts_path, "wb") as out:
-            for i in range(total):
-                seg = tmp_dir / f"{i:05d}{ext}"
-                if seg.exists():
-                    out.write(seg.read_bytes())
-        print(f"  ✓ 合并完成（MPEG-TS）: {ts_path}")
-        print(f"  ℹ .ts 文件可用 VLC / mpv 直接播放")
-        print(f'    转 mp4: ffmpeg -i "{ts_path}" -c copy "{mp4_path}"')
-        output_path = ts_path
-
-    # 清理临时分片
-    import shutil
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return output_path
 
