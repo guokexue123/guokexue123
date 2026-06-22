@@ -4,6 +4,13 @@ supjav.com 爬虫配置文件
 
 import os
 
+# ── 代理设置（可选，遇到地区封锁时填写） ─────────────────────────────────
+# 格式示例：
+#   PROXY = "http://127.0.0.1:7890"        # HTTP/HTTPS 代理（Clash 默认端口）
+#   PROXY = "socks5://127.0.0.1:1080"      # SOCKS5 代理
+#   PROXY = None                            # 不使用代理
+PROXY = None
+
 # ── 请求头：模拟 Chrome 120 浏览器 ──────────────────────────────────────
 HEADERS = {
     "User-Agent": (

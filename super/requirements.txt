@@ -2,5 +2,10 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 yt-dlp>=2024.1.0
-# 可选：curl_cffi 用于绕过 Cloudflare TLS 指纹检测
-# pip install curl_cffi
+
+# ── 反爬核心依赖（强烈推荐安装） ──────────────────────────────────────────
+# curl_cffi：模拟真实 Chrome TLS 指纹，绕过 Cloudflare Bot Management
+curl_cffi>=0.6.0
+
+# cloudscraper：自动执行 Cloudflare JS 挑战，破解 IUAM（5秒盾）
+cloudscraper>=1.2.71
