@@ -416,11 +416,12 @@ def download_hls(m3u8_url: str, output_name: str):
     ffmpeg_ok = False
     try:
         list_file = tmp_dir / "filelist.txt"
-        with open(list_file, "w") as f:
+        with open(list_file, "w", encoding="utf-8") as f:
             for i in range(total):
                 seg = tmp_dir / f"{i:05d}{ext}"
                 if seg.exists():
-                    f.write(f"file '{seg.resolve()}'\n")
+                    # as_posix() 将 Windows 反斜杠转为正斜杠，ffmpeg concat 必需
+                    f.write(f"file '{seg.resolve().as_posix()}'\n")
 
         subprocess.run([
             ffmpeg_bin, "-y", "-f", "concat", "-safe", "0",
