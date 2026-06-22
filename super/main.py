@@ -211,13 +211,31 @@ def run(url: str, output_dir: str = DOWNLOAD_DIR, debug: bool = False) -> bool:
 
 
 def _print_tips():
-    print("""
-  ── 解决 403 / 访问被拒绝 ─────────────────────────────────
-  方法 1（推荐）: 用浏览器打开页面 → Ctrl+S 另存为 HTML →
-                  在 config.py 设置 LOCAL_HTML_FILE = "path/to/saved.html"
-  方法 2: 在 config.py 设置 PROXY = "http://127.0.0.1:7890"（需代理软件）
-  ──────────────────────────────────────────────────────────
-""")
+    from config import PROXY, LOCAL_HTML_FILE
+    print()
+    print("  ── 解决 403 / 访问被拒绝 " + "─" * 34)
+    if PROXY:
+        # 代理已设，给出调试建议
+        print(f"  代理已配置: {PROXY}")
+        print("  代理仍然 403，可能原因：")
+        print("    1. 代理软件未运行（请确认端口可用）")
+        print("    2. 代理 IP 也被目标站封锁（换节点试试）")
+        print("    3. SOCKS5 代理需改为 HTTP 代理格式")
+        print()
+        print("  快速验证代理：")
+        print(f"    curl -x {PROXY} https://supjav.com/zh/132824.html -I")
+    else:
+        print("  方法 1（最简单）: 用浏览器打开目标页面 → Ctrl+S 另存为 HTML")
+        print("    然后在 config.py 设置:")
+        print('      LOCAL_HTML_FILE = r"C:\\path\\to\\132824.html"')
+        print()
+        print("  方法 2: 配置代理，在 config.py 设置:")
+        print('      PROXY = "http://127.0.0.1:7890"   # Clash HTTP 端口')
+        print('      PROXY = "socks5://127.0.0.1:7891"  # Clash SOCKS5 端口')
+    if not LOCAL_HTML_FILE:
+        print()
+        print("  ✓ LOCAL_HTML_FILE 方式完全绕过网络问题，最推荐")
+    print("  " + "─" * 54)
 
 
 def _show_screenshot(path: str):

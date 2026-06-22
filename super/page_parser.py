@@ -43,15 +43,16 @@ def _fetch_with_curl_cffi(url: str, referer: str = "") -> Optional[str]:
         if referer:
             headers["Referer"] = referer
 
-        # impersonate 参数让 curl_cffi 完整模拟浏览器 TLS 握手
-        proxies = {"https": PROXY, "http": PROXY} if PROXY else None
+        # curl_cffi 用 proxy= 字符串（None 表示不使用代理）
+        if PROXY:
+            logger.info(f"[curl_cffi] 使用代理: {PROXY}")
         resp = cffi_req.get(
             url,
             headers=headers,
             impersonate="chrome120",
             timeout=TIMEOUT,
             allow_redirects=True,
-            proxies=proxies,
+            proxy=PROXY,
         )
 
         if resp.status_code == 200:
@@ -91,7 +92,9 @@ def _fetch_with_cloudscraper(url: str, referer: str = "") -> Optional[str]:
         if referer:
             scraper.headers.update({"Referer": referer})
 
-        proxies = {"https": PROXY, "http": PROXY} if PROXY else None
+        if PROXY:
+            logger.info(f"[cloudscraper] 使用代理: {PROXY}")
+        proxies = {"http": PROXY, "https": PROXY} if PROXY else None
         resp = scraper.get(url, timeout=TIMEOUT, proxies=proxies)
 
         if resp.status_code == 200:
@@ -152,6 +155,30 @@ def _fetch_with_requests(url: str, referer: str = "") -> Optional[str]:
 
 # ─── 统一入口 ────────────────────────────────────────────────────────────────
 
+def check_proxy() -> bool:
+    """
+    代理连通性自检：用 requests 通过代理访问一个简单的测试地址。
+    返回 True 表示代理正常，False 表示代理不可用。
+    """
+    if not PROXY:
+        return False
+    test_url = "https://httpbin.org/ip"
+    try:
+        resp = requests.get(
+            test_url,
+            proxies={"http": PROXY, "https": PROXY},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info(f"[proxy] 连通性正常，出口 IP: {data.get('origin', '?')}")
+            return True
+        logger.warning(f"[proxy] 测试返回 HTTP {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"[proxy] 连通性测试失败: {e}")
+    return False
+
+
 def fetch_page(url: str, session=None) -> str:
     """
     获取页面 HTML，依次尝试三种方案：
@@ -162,6 +189,14 @@ def fetch_page(url: str, session=None) -> str:
     """
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
+
+    if PROXY:
+        print(f"    代理已配置: {PROXY}")
+        ok = check_proxy()
+        if not ok:
+            print(f"    ⚠ 代理连通性测试失败，请检查代理软件是否正在运行")
+        else:
+            print(f"    ✓ 代理连通正常")
 
     print("    尝试 Level 1: curl_cffi (TLS 指纹模拟)...")
     html = _fetch_with_curl_cffi(url, referer)
@@ -178,11 +213,7 @@ def fetch_page(url: str, session=None) -> str:
     if html and _is_real_page(html):
         return html
 
-    raise RuntimeError(
-        f"无法获取页面: {url}\n"
-        "  建议安装: pip install curl_cffi cloudscraper\n"
-        "  或使用代理: 在 config.py 中设置 PROXY"
-    )
+    raise RuntimeError(f"无法获取页面: {url}")
 
 
 def _is_real_page(html: str) -> bool:
