@@ -8,6 +8,7 @@ from .doodstream import DoodStreamExtractor
 from .streamtape import StreamtapeExtractor
 from .mixdrop import MixdropExtractor
 from .filemoon import FilemoonExtractor
+from .surrit import SurritStoreExtractor
 from .generic import GenericExtractor
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "StreamtapeExtractor",
     "MixdropExtractor",
     "FilemoonExtractor",
+    "SurritStoreExtractor",
     "GenericExtractor",
 ]
 
@@ -32,4 +34,6 @@ def get_extractor(url: str):
         return MixdropExtractor()
     if "filemoon" in host:
         return FilemoonExtractor()
+    if "surrit." in host:
+        return SurritStoreExtractor()
     return GenericExtractor()

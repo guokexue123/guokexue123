@@ -19,7 +19,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from config import HEADERS, TIMEOUT, MAX_RETRIES, PROXY
+from config import HEADERS, TIMEOUT, MAX_RETRIES, PROXY, NON_VIDEO_DOMAINS
 
 logger = logging.getLogger(__name__)
 
@@ -351,8 +351,31 @@ def _extract_server_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     return results
 
 
+def _is_video_candidate(url: str) -> bool:
+    """
+    过滤掉明显不是视频的 URL：
+    - .js / .css / .png / .gif / .svg / .woff 等静态资源
+    - 广告、统计、CDN 脚本域名
+    """
+    lower = url.lower()
+
+    # 排除静态资源扩展名（路径部分，忽略 query）
+    path = lower.split("?")[0]
+    skip_exts = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif",
+                 ".svg", ".woff", ".woff2", ".ttf", ".ico", ".xml", ".json")
+    if any(path.endswith(ext) for ext in skip_exts):
+        return False
+
+    # 排除已知非视频域名
+    for domain in NON_VIDEO_DOMAINS:
+        if domain in lower:
+            return False
+
+    return True
+
+
 def extract_embed_urls(html: str, page_url: str) -> list[str]:
-    """综合提取页面中所有候选视频嵌入 URL，去重后返回。"""
+    """综合提取页面中所有候选视频嵌入 URL，过滤非视频资源后去重返回。"""
     soup = BeautifulSoup(html, "lxml")
     seen: set[str] = set()
     results: list[str] = []
@@ -366,10 +389,10 @@ def extract_embed_urls(html: str, page_url: str) -> list[str]:
     )
     for url in sources:
         url = url.strip().rstrip("/")
-        if url and url not in seen:
+        if url and url not in seen and _is_video_candidate(url):
             seen.add(url)
             results.append(url)
-    logger.info(f"[extract_embed_urls] 共发现 {len(results)} 个候选 URL")
+    logger.info(f"[extract_embed_urls] 共发现 {len(results)} 个候选 URL（已过滤非视频资源）")
     return results
 
 

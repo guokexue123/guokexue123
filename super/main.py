@@ -52,37 +52,16 @@ def _sort_by_pref(urls: list[str], pref: str) -> list[str]:
     return preferred + others
 
 
-def _get_ffmpeg() -> str:
-    """查找可用的 ffmpeg 可执行文件路径（优先系统 ffmpeg，备用 imageio_ffmpeg）"""
-    import shutil
-    sys_ffmpeg = shutil.which("ffmpeg")
-    if sys_ffmpeg:
-        # 验证系统 ffmpeg 能正常启动（可能有依赖缺失）
-        try:
-            r = subprocess.run([sys_ffmpeg, "-version"], capture_output=True, timeout=5)
-            if r.returncode == 0:
-                return sys_ffmpeg
-        except Exception:
-            pass
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError:
-        pass
-    raise FileNotFoundError("找不到 ffmpeg，请安装: pip install imageio[ffmpeg]")
-
-
 def screenshot_at_10s(video_path: str) -> str | None:
     """
     用 ffmpeg 截取视频第 10 秒的画面，保存为 jpg。
-    自动检测系统 ffmpeg 或 imageio_ffmpeg 内置版本。
-    返回截图路径，失败返回 None。
+    优先使用 config.FFMPEG_PATH，再依次尝试系统 PATH 和 imageio_ffmpeg。
     """
+    from downloader import get_ffmpeg_path
     screenshot_path = video_path.rsplit(".", 1)[0] + "_10s.jpg"
-    try:
-        ffmpeg = _get_ffmpeg()
-    except FileNotFoundError as e:
-        logging.getLogger(__name__).warning(f"[screenshot] {e}")
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        logging.getLogger(__name__).warning("[screenshot] 找不到 ffmpeg")
         return None
 
     cmd = [

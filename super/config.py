@@ -1,31 +1,31 @@
 """
-supjav.com 爬虫配置文件
+supjav.com / 123av.com 爬虫配置文件
 """
 
 import os
 
-# ── 代理设置（可选，遇到地区封锁时填写） ─────────────────────────────────
-# 格式示例：
+# ── 代理设置 ───────────────────────────────────────────────────────────────
 #   PROXY = "http://127.0.0.1:7890"        # HTTP/HTTPS 代理（Clash 默认端口）
 #   PROXY = "socks5://127.0.0.1:1080"      # SOCKS5 代理
 #   PROXY = None                            # 不使用代理
 PROXY = None
 
+# ── ffmpeg 可执行文件路径 ──────────────────────────────────────────────────
+# 填写本地 ffmpeg 路径后，截图和 HLS 合并都会使用指定版本
+# Windows 示例： FFMPEG_PATH = r"D:\Tool\ffmpeg\bin\ffmpeg.exe"
+# None 表示自动查找（依次尝试系统 PATH → imageio_ffmpeg 内置版本）
+FFMPEG_PATH = r"D:\Tool\ffmpeg\bin\ffmpeg.exe"
+
 # ── 服务器偏好（优先选择哪个视频托管服务） ────────────────────────────────
-# 可选值：
-#   "DS"  → DoodStream（推荐，速度快）
+#   "DS"  → DoodStream
 #   "ST"  → Streamtape
 #   "MD"  → Mixdrop
 #   "FM"  → Filemoon
+#   "SR"  → Surrit（123av 专用）
 #   ""    → 不过滤，按页面顺序尝试所有服务器
 SERVER_PREF = "DS"
 
 # ── 本地 HTML 注入（跳过网络请求，直接解析本地保存的页面） ────────────────
-# 使用方法：
-#   1. 用浏览器打开目标 URL（如 https://supjav.com/zh/132824.html）
-#   2. Ctrl+S 另存为"网页，仅 HTML"（.html 文件）
-#   3. 把路径填到下面，脚本会直接解析本地文件，无需联网
-# 不需要时设置为 None
 LOCAL_HTML_FILE = None
 
 # ── 请求头：模拟 Chrome 120 浏览器 ──────────────────────────────────────
@@ -56,7 +56,7 @@ TIMEOUT = 30
 # ── 重试次数 ──────────────────────────────────────────────────────────────
 MAX_RETRIES = 3
 
-# ── yt-dlp 下载质量偏好（按优先级） ─────────────────────────────────────
+# ── yt-dlp 下载质量偏好 ───────────────────────────────────────────────────
 YDL_FORMAT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
 
 # ── 服务器简称 → 域名关键词映射 ──────────────────────────────────────────
@@ -65,9 +65,10 @@ SERVER_HOSTS: dict[str, list[str]] = {
     "ST": ["streamtape"],
     "MD": ["mixdrop"],
     "FM": ["filemoon"],
+    "SR": ["surrit."],
 }
 
-# ── 支持的视频托管平台（supjav 常用） ────────────────────────────────────
+# ── 支持的视频托管平台 ────────────────────────────────────────────────────
 SUPPORTED_HOSTS = [
     "doodstream.com",
     "dood.watch",
@@ -86,6 +87,26 @@ SUPPORTED_HOSTS = [
     "upstream.to",
     "emturbovid.com",
     "embedrise.com",
-    "okru",
+    "surrit.store",
+    "surrit.com",
     "ok.ru",
 ]
+
+# ── 非视频域名黑名单（从提取结果中排除） ─────────────────────────────────
+NON_VIDEO_DOMAINS = [
+    "googletagmanager.com",
+    "google-analytics.com",
+    "cloudflareinsights.com",
+    "cloudflare.com/cdn",
+    "wingsmob.com",
+    "magsrv.com",
+    "exoclick.com",
+    "trafficjunky.net",
+    "juicyads.com",
+    "a-ads.com",
+    "adnxs.com",
+    "doubleclick.net",
+    "amazon-adsystem.com",
+    "scorecardresearch.com",
+]
+
