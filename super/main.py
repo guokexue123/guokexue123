@@ -18,14 +18,16 @@ supjav.com 视频爬虫主入口
 
 import sys
 import os
-import argparse
 import logging
-from pathlib import Path
 
 from page_parser import fetch_page, extract_embed_urls, get_page_title
 from extractors import get_extractor
 from downloader import download_with_ytdlp, download_direct
 from config import DOWNLOAD_DIR, SUPPORTED_HOSTS
+
+# ── 目标 URL（直接修改这里） ───────────────────────────────────────────────
+TARGET_URL = "https://supjav.com/zh/132824.html"
+# ──────────────────────────────────────────────────────────────────────────
 
 
 def setup_logging(debug: bool = False):
@@ -113,35 +115,6 @@ def run(url: str, output_dir: str = DOWNLOAD_DIR, debug: bool = False) -> bool:
     return False
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="supjav.com 视频下载器",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  python main.py https://supjav.com/zh/132824.html
-  python main.py https://supjav.com/zh/132824.html --output ~/Videos
-  python main.py https://supjav.com/zh/132824.html --debug
-        """,
-    )
-    parser.add_argument("url", help="supjav.com 视频页面 URL")
-    parser.add_argument(
-        "--output", "-o",
-        default=DOWNLOAD_DIR,
-        help=f"下载目录（默认: {DOWNLOAD_DIR}）",
-    )
-    parser.add_argument(
-        "--debug", "-d",
-        action="store_true",
-        help="开启详细调试日志",
-    )
-
-    args = parser.parse_args()
-    success = run(args.url, args.output, args.debug)
-    sys.exit(0 if success else 1)
-
-
 if __name__ == "__main__":
-    main()
+    success = run(TARGET_URL, DOWNLOAD_DIR)
+    sys.exit(0 if success else 1)
