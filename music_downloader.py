@@ -11,10 +11,10 @@
   python3 music_downloader.py 五月天 --debug       # 打印原始 JSON 用于诊断
 """
 
-import os, sys, json, time, argparse, threading, urllib.request, urllib.parse, urllib.error
+import os, sys, json, argparse, threading, urllib.request, urllib.parse, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── 全局配置 ─────────────────────────────────────────────────────────────────
+# ── 全局 ─────────────────────────────────────────────────────────────────────
 HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.6",
@@ -25,8 +25,7 @@ HEADERS = {
         "Gecko/20100101 Firefox/152.0"
     ),
 }
-
-DEBUG = False          # --debug 时置为 True
+DEBUG = False
 _lock = threading.Lock()
 
 
@@ -36,121 +35,90 @@ def log(*a, **k):
 
 
 def dbg(tag, data):
-    if DEBUG:
-        with _lock:
-            print(f"\n[DEBUG:{tag}]")
-            print(json.dumps(data, ensure_ascii=False, indent=2)[:2000])
+    if not DEBUG:
+        return
+    with _lock:
+        text = json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, (dict, list)) else str(data)
+        print(f"\n[DEBUG:{tag}] {text[:1500]}")
 
 
 # ── 平台配置 ─────────────────────────────────────────────────────────────────
 PLATFORMS = {
-    "migu": {
-        "label": "咪咕",
-        "search_url": "https://api.xcvts.cn/api/music/migu",
-        "search_params": lambda kw, page, num: {"gm": kw, "n": "", "num": num, "type": "json"},
-        # 如果列表里没有 URL，尝试此端点获取下载链接：传入 song_id
-        "url_api": None,
-    },
-    "netease": {
-        "label": "网易云",
-        "search_url": "https://api.vkeys.cn/v2/music/netease",
-        "search_params": lambda kw, page, num: {"word": kw, "page": page, "num": num},
-        "url_api": None,
-    },
-    "qq": {
-        "label": "QQ音乐",
-        "search_url": "https://tang.api.s01s.cn/music_open_api.php",
-        "search_params": lambda kw, page, num: {"msg": kw, "type": "json"},
-        "url_api": None,
-    },
-    "kuwo": {
-        "label": "酷我",
-        "search_url": "https://kw-api.cenguigui.cn/",
-        "search_params": lambda kw, page, num: {"name": kw, "page": page, "limit": num},
-        "url_api": None,
-    },
+    "migu":    {"label": "咪咕"},
+    "netease": {"label": "网易云"},
+    "qq":      {"label": "QQ音乐"},
+    "kuwo":    {"label": "酷我"},
 }
 
 
-# ── URL 自动检测 ──────────────────────────────────────────────────────────────
-# 优先检查的字段名（按常见程度排列）
+# ── 网络工具 ─────────────────────────────────────────────────────────────────
+def http_get(url, timeout=20):
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+# ── URL 检测 ─────────────────────────────────────────────────────────────────
 _URL_FIELDS = [
-    # 通用
     "url", "src", "link", "audio", "mp3", "flac",
-    # 驼峰变体
     "playUrl", "musicUrl", "audioUrl", "fileUrl", "songUrl", "downUrl",
     "downloadUrl", "streamUrl", "listenUrl", "mp3Url", "flacUrl",
-    # 下划线变体
     "play_url", "music_url", "audio_url", "file_url", "song_url",
     "down_url", "download_url", "stream_url", "listen_url",
-    # 咪咕特有质量字段
     "sqUrl", "hqUrl", "freeUrl", "freeflacUrl", "normalUrl",
     "SQ", "HQ", "320", "128",
-    # 其他
     "source", "path", "href", "media", "mediaUrl",
 ]
 
+_IMG_SIGNS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+              "img.", "image.", "pic.", "cover.", "thumb.", "lrc.", ".lrc",
+              "type=lyr")  # 酷我歌词接口
+
+_AUDIO_CDNS = (
+    "freetyst.nf.migu.cn",
+    "music.126.net",
+    "dl.stream.qqmusic",
+    # 注意：kw-api.cenguigui.cn 同时有歌词和音频接口，
+    # 不能整域名匹配，需靠 type=song 参数区分
+)
+_AUDIO_PARAMS = ("format=mp3", "format=flac", "type=song")
+_AUDIO_EXTS   = ("mp3", "flac", "m4a", "ogg", "aac", "wav")
+
 
 def _is_audio_url(v):
-    """判断字符串是否像音频 URL（排除图片/歌词等误判）"""
     if not isinstance(v, str) or not v.startswith("http"):
         return False
     lo = v.lower()
-    # 排除明显的图片/歌词域名或扩展名
-    _EXCLUDE = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
-                "img.", "image.", "pic.", "cover.", "thumb.", "lrc.", ".lrc")
-    if any(lo.endswith(x) or x in lo for x in _EXCLUDE):
+    if any(lo.endswith(x) or x in lo for x in _IMG_SIGNS):
         return False
-    # 包含明确的音频扩展名
-    if any(lo.endswith(f".{x}") or f".{x}?" in lo for x in
-           ("mp3", "flac", "m4a", "ogg", "aac", "wav")):
+    if any(lo.endswith(f".{e}") or f".{e}?" in lo for e in _AUDIO_EXTS):
         return True
-    # 包含音频参数特征
-    if any(x in lo for x in (
-        "format=mp3", "format=flac", "type=song",
-        "music.126.net",          # 网易云 CDN
-        "freetyst.nf.migu.cn",    # 咪咕音乐 CDN
-        "kw-api.cenguigui.cn",    # 酷我 API
-        "dl.stream.qqmusic",      # QQ音乐 CDN
-    )):
+    if any(p in lo for p in _AUDIO_PARAMS + _AUDIO_CDNS):
         return True
     return False
 
 
-def find_audio_url(item):
-    """
-    多策略音频 URL 提取：
-    1. 按优先列表检查已知字段名
-    2. 扫描全部字段的字符串值
-    3. 递归检查嵌套 dict
-    """
-    if not isinstance(item, dict):
+def find_audio_url(obj):
+    """三层策略：已知字段 → 全字段扫描 → 递归嵌套 dict"""
+    if not isinstance(obj, dict):
         return ""
-
-    # 策略1：已知字段名（含大小写变体）
-    for field in _URL_FIELDS:
-        for key in (field, field.lower(), field.upper()):
-            v = item.get(key, "")
-            if _is_audio_url(v):
-                return v
-
-    # 策略2：扫描全部字符串字段
-    for k, v in item.items():
+    for f in _URL_FIELDS:
+        for key in (f, f.lower(), f.upper()):
+            if _is_audio_url(obj.get(key, "")):
+                return obj[key]
+    for v in obj.values():
         if _is_audio_url(v):
             return v
-
-    # 策略3：递归嵌套 dict
-    for k, v in item.items():
+    for v in obj.values():
         if isinstance(v, dict):
-            found = find_audio_url(v)
-            if found:
-                return found
-
+            u = find_audio_url(v)
+            if u:
+                return u
     return ""
 
 
+# ── 响应解析工具 ──────────────────────────────────────────────────────────────
 def _field(item, *keys):
-    """取第一个非空字段值"""
     for k in keys:
         v = item.get(k, "")
         if v and isinstance(v, str):
@@ -158,15 +126,14 @@ def _field(item, *keys):
     return ""
 
 
-# ── 响应解析 ──────────────────────────────────────────────────────────────────
-def _to_song_list(data):
-    """从任意层级的响应 JSON 中提取歌曲列表"""
+def _to_list(data):
+    """从任意层级的响应中找歌曲列表"""
     if isinstance(data, list):
         return data
     if not isinstance(data, dict):
         return []
-    for key in ("data", "list", "songs", "result", "music", "items", "records"):
-        v = data.get(key)
+    for k in ("data", "list", "songs", "result", "music", "items", "records"):
+        v = data.get(k)
         if isinstance(v, list):
             return v
         if isinstance(v, dict):
@@ -177,65 +144,193 @@ def _to_song_list(data):
     return []
 
 
-def parse_songs(data, platform_key):
-    raw_list = _to_song_list(data)
-    songs = []
-    for item in raw_list:
-        if not isinstance(item, dict):
-            continue
-        name = _field(item,
-                      "name", "title", "songName", "song_name", "songname",
-                      "song", "musicName", "music_name")
-        singer = _field(item,
-                        "singer", "author", "artist", "singerName", "singer_name",
-                        "artistName", "artist_name", "singers", "singerlist")
-        url = find_audio_url(item)
-        song_id = _field(item, "id", "songId", "song_id", "rid", "copyrightId", "cid", "musicId")
-        cover = find_cover(item)
+def _item_to_song(item, platform_key):
+    if not isinstance(item, dict):
+        return None
+    name = _field(item,
+                  # 通用
+                  "name", "title", "song", "musicName",
+                  # QQ 专用
+                  "song_title", "songTitle",
+                  # 其他变体
+                  "songName", "song_name", "songname", "music_name")
+    singer = _field(item,
+                    "singer", "author", "artist", "artists",
+                    # QQ 专用
+                    "singer_name", "singerName",
+                    # 其他变体
+                    "artistName", "artist_name", "singers", "singerlist")
+    song_id = _field(item,
+                     "id", "rid",
+                     # 网易云
+                     "songId", "song_id",
+                     # QQ 专用
+                     "song_mid", "songMid",
+                     # 其他
+                     "copyrightId", "cid", "musicId")
+    url   = find_audio_url(item)
+    cover = _field(item, "pic", "cover", "picUrl", "pic_url",
+                   "coverUrl", "albumPic", "album_pic", "image", "thumb")
 
-        if name:
-            songs.append({
-                "name": name, "singer": singer or "未知",
-                "url": url, "id": song_id, "cover": cover,
-                "_raw": item,          # 保留原始数据供后续处理
-                "_platform": platform_key,
-            })
+    if not name:
+        return None
+    return {
+        "name": name, "singer": singer or "未知",
+        "url": url, "id": song_id, "cover": cover,
+        "_platform": platform_key,
+        "_raw": item,
+    }
+
+
+def parse_response(data, platform_key):
+    items = _to_list(data)
+    songs = []
+    for item in items:
+        s = _item_to_song(item, platform_key)
+        if s:
+            songs.append(s)
     return songs
 
 
-def find_cover(item):
-    for f in ("pic", "cover", "picUrl", "pic_url", "coverUrl", "cover_url",
-              "albumPic", "album_pic", "image", "thumb", "imgUrl", "img"):
-        v = item.get(f, "")
-        if isinstance(v, str) and v.startswith("http"):
-            return v
+# ── 第一步：搜索列表 ──────────────────────────────────────────────────────────
+def search_migu(keyword, num):
+    params = urllib.parse.urlencode({"gm": keyword, "n": "", "num": num, "type": "json"})
+    data = http_get(f"https://api.xcvts.cn/api/music/migu?{params}")
+    dbg("migu/search", data)
+    return parse_response(data, "migu")
+
+
+def search_netease(keyword, page, num):
+    params = urllib.parse.urlencode({"word": keyword, "page": page, "num": num})
+    data = http_get(f"https://api.vkeys.cn/v2/music/netease?{params}")
+    dbg("netease/search", data)
+    return parse_response(data, "netease")
+
+
+def search_qq(keyword, num):
+    params = urllib.parse.urlencode({"msg": keyword, "num": num, "type": "json"})
+    data = http_get(f"https://tang.api.s01s.cn/music_open_api.php?{params}")
+    dbg("qq/search", data)
+    return parse_response(data, "qq")
+
+
+def search_kuwo(keyword, page, num):
+    params = urllib.parse.urlencode({"name": keyword, "page": page, "limit": num})
+    data = http_get(f"https://kw-api.cenguigui.cn/?{params}")
+    dbg("kuwo/search", data)
+    return parse_response(data, "kuwo")
+
+
+# ── 第二步：为无 URL 的歌曲解析真实链接 ──────────────────────────────────────
+
+def _scan_for_url(data):
+    """在响应中的多个位置扫描音频 URL"""
+    # 直接在顶层找
+    u = find_audio_url(data)
+    if u:
+        return u
+    # 在歌曲列表第一项里找
+    items = _to_list(data)
+    if items:
+        u = find_audio_url(items[0])
+        if u:
+            return u
     return ""
 
 
-# ── 网络请求 ──────────────────────────────────────────────────────────────────
-def http_get(url, extra_headers=None, timeout=20):
-    hdrs = {**HEADERS, **(extra_headers or {})}
-    req = urllib.request.Request(url, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read(), dict(resp.headers)
-
-
-def fetch_platform(platform_key, keyword, page=1, num=10):
-    cfg = PLATFORMS[platform_key]
-    params = cfg["search_params"](keyword, page, num)
-    url = cfg["search_url"] + "?" + urllib.parse.urlencode(params)
-    log(f"  [{cfg['label']}] GET {url}")
+def resolve_migu_url(song):
+    """
+    咪咕列表不含 URL，用歌名+歌手做精确搜索取得下载链接。
+    API: ?gm=歌手&n=歌名&num=1&type=json
+    """
+    params = urllib.parse.urlencode({
+        "gm": song["singer"], "n": song["name"], "num": "1", "type": "json"
+    })
+    url = f"https://api.xcvts.cn/api/music/migu?{params}"
+    dbg("migu/resolve", url)
     try:
-        raw, _ = http_get(url)
-        data = json.loads(raw)
-        dbg(f"{platform_key}/raw", data)
-        songs = parse_songs(data, platform_key)
-        no_url = sum(1 for s in songs if not s["url"])
-        log(f"  [{cfg['label']}] 共 {len(songs)} 首，其中 {no_url} 首无直链")
-        return platform_key, songs
+        data = http_get(url, timeout=15)
+        dbg("migu/resolve/resp", data)
+        return _scan_for_url(data)
     except Exception as e:
-        log(f"  [{cfg['label']}] 失败: {e}")
-        return platform_key, []
+        dbg("migu/resolve/err", str(e))
+        return ""
+
+
+def resolve_netease_url(song):
+    """
+    网易云列表有 id，用 id 换取播放 URL。
+    尝试多种端点格式。
+    """
+    sid = song.get("id", "")
+    if not sid:
+        return ""
+    candidates = [
+        f"https://api.vkeys.cn/v2/music/netease?id={sid}",
+        f"https://api.vkeys.cn/v2/music/netease?id={sid}&type=json",
+        f"https://api.vkeys.cn/v2/music/netease/url?id={sid}",
+        f"https://api.vkeys.cn/v2/music/netease?word={urllib.parse.quote(song['name'])}&id={sid}&num=1",
+    ]
+    for ep in candidates:
+        dbg("netease/resolve", ep)
+        try:
+            data = http_get(ep, timeout=15)
+            dbg("netease/resolve/resp", data)
+            u = _scan_for_url(data)
+            if u:
+                return u
+        except Exception as e:
+            dbg("netease/resolve/err", str(e))
+    return ""
+
+
+def resolve_qq_url(song):
+    """
+    QQ音乐列表有 song_mid（存为 id），用 id/song_mid 换取播放 URL。
+    """
+    mid = song.get("id", "")
+    if not mid:
+        return ""
+    candidates = [
+        f"https://tang.api.s01s.cn/music_open_api.php?id={mid}&type=json",
+        f"https://tang.api.s01s.cn/music_open_api.php?song_mid={mid}&type=json",
+        f"https://tang.api.s01s.cn/music_open_api.php?mid={mid}&type=json",
+    ]
+    for ep in candidates:
+        dbg("qq/resolve", ep)
+        try:
+            data = http_get(ep, timeout=15)
+            dbg("qq/resolve/resp", data)
+            u = _scan_for_url(data)
+            if u:
+                return u
+        except Exception as e:
+            dbg("qq/resolve/err", str(e))
+    return ""
+
+
+URL_RESOLVERS = {
+    "migu":    resolve_migu_url,
+    "netease": resolve_netease_url,
+    "qq":      resolve_qq_url,
+    "kuwo":    None,   # 列表已含 URL
+}
+
+
+def resolve_song_url(song):
+    """对无直链歌曲调用平台专属解析器，原地更新 song['url']"""
+    if song["url"]:
+        return song
+    pk = song["_platform"]
+    resolver = URL_RESOLVERS.get(pk)
+    if resolver:
+        u = resolver(song)
+        if u:
+            song["url"] = u
+            log(f"    [解析成功] {song['singer']} - {song['name']} [{PLATFORMS[pk]['label']}]")
+        else:
+            log(f"    [解析失败] {song['singer']} - {song['name']} [{PLATFORMS[pk]['label']}]")
+    return song
 
 
 # ── 下载 ─────────────────────────────────────────────────────────────────────
@@ -250,12 +345,11 @@ def guess_ext(url):
     for ext in ("flac", "mp3", "m4a", "ogg", "aac", "wav"):
         if lo.endswith(f".{ext}"):
             return ext
-    if "flac" in url.lower():
-        return "flac"
-    return "mp3"
+    return "flac" if "flac" in url.lower() else "mp3"
 
 
-def download_song(song, label, save_dir, idx, total):
+def download_song(song, save_dir, idx, total):
+    label  = PLATFORMS[song["_platform"]]["label"]
     name   = sanitize(song["name"])
     singer = sanitize(song["singer"])
     url    = song["url"]
@@ -275,7 +369,9 @@ def download_song(song, label, save_dir, idx, total):
     log(f"[{idx}/{total}] 下载: {filename}")
     log(f"       {url}")
     try:
-        data, hdrs = http_get(url, timeout=60)
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
         with open(filepath, "wb") as f:
             f.write(data)
         log(f"       完成 ({len(data)/1024:.1f} KB) → {filepath}")
@@ -290,63 +386,89 @@ def download_song(song, label, save_dir, idx, total):
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 def main():
     global DEBUG
-    parser = argparse.ArgumentParser(description="多平台音乐下载器")
-    parser.add_argument("keyword", nargs="?", default="五月天")
-    parser.add_argument("-p", "--platform",
-                        choices=list(PLATFORMS.keys()) + ["all"], default="all")
-    parser.add_argument("-N", "--num", type=int, default=10)
-    parser.add_argument("--page", type=int, default=1)
-    parser.add_argument("-o", "--output", default="downloads")
-    parser.add_argument("--list-only", action="store_true")
-    parser.add_argument("--workers", type=int, default=3)
-    parser.add_argument("--debug", action="store_true",
-                        help="打印原始 API 响应 JSON（诊断用）")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="多平台音乐下载器（咪咕/网易云/QQ/酷我）")
+    ap.add_argument("keyword", nargs="?", default="五月天")
+    ap.add_argument("-p", "--platform",
+                    choices=list(PLATFORMS) + ["all"], default="all")
+    ap.add_argument("-N", "--num",  type=int, default=10, help="每平台结果数（默认10）")
+    ap.add_argument("--page",       type=int, default=1)
+    ap.add_argument("-o", "--output", default="downloads")
+    ap.add_argument("--list-only",  action="store_true")
+    ap.add_argument("--workers",    type=int, default=3, help="并发线程数（默认3）")
+    ap.add_argument("--debug",      action="store_true", help="打印原始 API JSON")
+    args = ap.parse_args()
     DEBUG = args.debug
 
     os.makedirs(args.output, exist_ok=True)
     targets = list(PLATFORMS) if args.platform == "all" else [args.platform]
-
     print(f"\n搜索「{args.keyword}」- 平台: {', '.join(targets)}\n")
 
-    # ── 1. 并发查询 ───────────────────────────────────────────────────────────
+    # ── 步骤1：并发搜索各平台 ────────────────────────────────────────────────
+    def _search(pk):
+        label = PLATFORMS[pk]["label"]
+        log(f"  [{label}] 搜索中…")
+        try:
+            if pk == "migu":
+                songs = search_migu(args.keyword, args.num)
+            elif pk == "netease":
+                songs = search_netease(args.keyword, args.page, args.num)
+            elif pk == "qq":
+                songs = search_qq(args.keyword, args.num)
+            else:
+                songs = search_kuwo(args.keyword, args.page, args.num)
+            no_url = sum(1 for s in songs if not s["url"])
+            log(f"  [{label}] {len(songs)} 首，{no_url} 首需二次解析")
+            return pk, songs
+        except Exception as e:
+            log(f"  [{label}] 搜索失败: {e}")
+            return pk, []
+
     all_songs = []
     with ThreadPoolExecutor(max_workers=len(targets)) as ex:
-        futs = {ex.submit(fetch_platform, pk, args.keyword, args.page, args.num): pk
-                for pk in targets}
-        for fut in as_completed(futs):
-            pk, songs = fut.result()
-            for s in songs:
-                all_songs.append((pk, s))
+        for pk, songs in ex.map(_search, targets):
+            all_songs.extend(songs)
 
     if not all_songs:
         print("[!] 所有平台均无结果。")
         sys.exit(1)
 
-    # ── 2. 列出结果 ──────────────────────────────────────────────────────────
+    # ── 步骤2：对无 URL 的歌曲并发解析真实链接 ──────────────────────────────
+    need_resolve = [s for s in all_songs if not s["url"]]
+    if need_resolve:
+        print(f"\n[二次解析] 共 {len(need_resolve)} 首需要解析链接…")
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            list(ex.map(resolve_song_url, need_resolve))
+
+    # ── 步骤3：显示列表 ──────────────────────────────────────────────────────
     print(f"\n共找到 {len(all_songs)} 首:\n")
-    for i, (pk, s) in enumerate(all_songs, 1):
-        label = PLATFORMS[pk]["label"]
+    has_url = 0
+    for i, s in enumerate(all_songs, 1):
+        label = PLATFORMS[s["_platform"]]["label"]
         flag  = "✓" if s["url"] else "✗"
         print(f"  {i:3d}. [{flag}][{label}] {s['singer']} - {s['name']}")
-        if DEBUG and not s["url"]:
+        if s["url"]:
+            has_url += 1
+        elif DEBUG:
             raw = s.get("_raw", {})
             non_empty = {k: v for k, v in raw.items()
-                         if isinstance(v, str) and v and k not in ("name","singer","cover")}
-            print(f"         可用字段: {non_empty}")
-    print()
+                         if isinstance(v, str) and v
+                         and k not in ("name", "singer", "title", "song",
+                                       "song_title", "singer_name", "cover", "pic")}
+            if non_empty:
+                print(f"         原始字段: {non_empty}")
+    print(f"\n有效链接: {has_url}/{len(all_songs)}")
 
     if args.list_only:
         return
 
-    # ── 3. 下载 ──────────────────────────────────────────────────────────────
+    # ── 步骤4：下载 ─────────────────────────────────────────────────────────
+    print()
     ok = fail = 0
     total = len(all_songs)
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {
-            ex.submit(download_song, s, PLATFORMS[pk]["label"],
-                      args.output, i, total): i
-            for i, (pk, s) in enumerate(all_songs, 1)
+            ex.submit(download_song, s, args.output, i, total): i
+            for i, s in enumerate(all_songs, 1)
         }
         for fut in as_completed(futs):
             if fut.result():
