@@ -522,7 +522,7 @@
         shortcutCloseModal:"提示：按 Esc 可以关闭弹窗。",
         searchTitle:"歌曲搜索", searchSubtitle:"支持咪咕 / 网易云 / QQ / 酷我", searchButton:"搜索",
         perSourceCount:"每个源加载", perSourceCountTail:"首结果", loadMore:"加载更多",
-        searchStatusIdle:"尚未搜索，试试输入"林俊杰"？", searchStatusSearching:"正在搜索中…",
+        searchStatusIdle:'尚未搜索，试试输入"林俊杰"？', searchStatusSearching:"正在搜索中…",
         searchStatusDone:"搜索完成。", searchStatusNoSource:"请至少选择一个音乐源。",
         playerTitle:"正在播放", playerSubtitle:"歌词动态高亮 · 炫酷霓虹", coverHint:"搜索并播放一首歌吧！",
         playerStatusIdle:"空闲", playerStatusLoading:"加载音源中…", playerStatusPlaying:"播放中", playerStatusPaused:"已暂停",
@@ -779,13 +779,14 @@
       if(!mid) return;
       const url=`https://tang.api.s01s.cn/music_open_api.php?msg=${encodeURIComponent(msg)}&type=json&mid=${encodeURIComponent(mid)}`;
       function pickBestPlayUrl(d){
-        if(d.song_play_url_sq) return {url:d.song_play_url_sq,tag:'lossless',label:'LOSSLESS'};
-        if(d.song_play_url_pq) return {url:d.song_play_url_pq,tag:'lossless',label:'LOSSLESS'};
-        if(d.song_play_url_hq) return {url:d.song_play_url_hq,tag:'hq',label:'HQ'};
-        if(d.song_play_url_standard) return {url:d.song_play_url_standard,tag:'standard',label:'STD'};
-        if(d.song_play_url_fq) return {url:d.song_play_url_fq,tag:'low',label:'LOW'};
-        if(d.song_play_url) return {url:d.song_play_url,tag:null,label:null};
-        return {url:null,tag:null,label:null};
+        if(d.song_play_url_sq)     return {url:d.song_play_url_sq,    tag:'lossless', label:'LOSSLESS', text:(`SQ ${d.kbps_sq||''}`).trim()};
+        if(d.song_play_url_pq)     return {url:d.song_play_url_pq,    tag:'lossless', label:'LOSSLESS', text:(`PQ ${d.kbps_pq||''}`).trim()};
+        if(d.song_play_url_accom)  return {url:d.song_play_url_accom, tag:'hq',       label:'HQ',       text:(`ACCOM ${d.kbps_accom||''}`).trim()};
+        if(d.song_play_url_hq)     return {url:d.song_play_url_hq,    tag:'hq',       label:'HQ',       text:(`HQ ${d.kbps_hq||''}`).trim()};
+        if(d.song_play_url_standard) return {url:d.song_play_url_standard,tag:'standard',label:'STD',   text:(`STD ${d.kbps_standard||''}`).trim()};
+        if(d.song_play_url_fq)     return {url:d.song_play_url_fq,    tag:'low',      label:'LOW',      text:(`FQ ${d.kbps_fq||''}`).trim()};
+        if(d.song_play_url)        return {url:d.song_play_url,       tag:null,       label:null,       text:null};
+        return {url:null,tag:null,label:null,text:null};
       }
       try{
         const res=await fetch(url); const d=await res.json();
@@ -798,6 +799,7 @@
         const best=pickBestPlayUrl(d);
         track.audioUrl=best.url||track.audioUrl;
         track.lrc=d.song_lyric||d.lyric||track.lrc;
+        track.qqQualityText=best.text||(d.vip?`VIP:${d.vip}`:null)||track.qqQualityText;
         if(best.tag&&best.label){ track.quality=best.tag; track.qualityLabel=best.label; }
         if(track.audioUrl){ const q=inferQualityFromUrl(track.audioUrl); if(q&&q.label){ track.quality=q.tag; track.qualityLabel=q.label; } }
         track.detailsLoaded=true;
