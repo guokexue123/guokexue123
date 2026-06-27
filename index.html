@@ -3093,13 +3093,33 @@
       let nextNormalSpawn = 900+Math.random()*2200;
 
       function spawnMeteor(big){
-        const sx = W*(0.35+Math.random()*0.65);
-        const sy = Math.random()*(big?H*0.3:H*0.2);
-        const angle = (205+Math.random()*25)*Math.PI/180;
+        // 轨迹类型：0=顶部飞入(原有), 1=穿越中央斜线, 2=右侧飞入
+        // 普通流星随机三种；超大流星固定穿越中央
+        const type = big ? 1 : Math.floor(Math.random()*3);
+
+        let sx, sy, angle;
+        if(type === 1){
+          // 穿越屏幕中央：从右上角 1/4 处出发，直穿向左下，视觉上横跨中间
+          sx = W*(0.55 + Math.random()*0.45);
+          sy = H*(0.05 + Math.random()*0.25);
+          // 角度偏大，使轨迹更平，穿越中央区域
+          angle = (215 + Math.random()*20)*Math.PI/180;
+        } else if(type === 2){
+          // 从右侧边缘飞入，偏水平
+          sx = W*(0.85 + Math.random()*0.15);
+          sy = H*(0.1 + Math.random()*0.45);
+          angle = (195 + Math.random()*15)*Math.PI/180;
+        } else {
+          // 顶部飞入（原有）
+          sx = W*(0.35 + Math.random()*0.65);
+          sy = Math.random()*H*0.18;
+          angle = (205 + Math.random()*25)*Math.PI/180;
+        }
+
         const speed  = big ? (10+Math.random()*7) : (5+Math.random()*5);
-        const length = big ? (280+Math.random()*200) : (90+Math.random()*130);
+        const length = big ? (320+Math.random()*220) : (90+Math.random()*130);
         const width  = big ? (2.4+Math.random()*1.4) : (0.9+Math.random()*0.9);
-        const duration = big ? 1100 : (500+Math.random()*500);
+        const duration = big ? 1300 : (500+Math.random()*500);
 
         const sparkCount = big ? 12 : (3+Math.floor(Math.random()*4));
         const sparks = [];
