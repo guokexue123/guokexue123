@@ -3,3 +3,6 @@ downloads/
 *.mp4
 *.ts
 playlist_cache.m3u8
+
+# 浏览器调试 profile：含 cookie 和登录凭据，绝不提交
+chrome-debug-profile/
