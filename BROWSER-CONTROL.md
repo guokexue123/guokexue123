@@ -2,8 +2,30 @@
 
 让 Claude Code 桌面客户端控制 Chrome：打开网页、登录、填表、点击、抓数据。
 
-能力来自 [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp)（29 个工具），
-配套的 6 个 skill 教 Claude 怎么正确使用这些工具。
+能力来自两个 MCP server，配套的 6 个 skill 教 Claude 怎么正确使用这些工具：
+
+- [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp)（29 个工具）
+- [@playwright/mcp](https://github.com/microsoft/playwright-mcp)
+
+## 两个 server 选哪个
+
+它们功能高度重叠，**同时开着会让 Claude 不知道该用哪套工具**，也会让工具列表翻倍。
+建议先都装上试一次，选定后把另一个删掉：
+
+```bash
+claude mcp remove playwright --scope user      # 或
+claude mcp remove chrome-devtools --scope user
+```
+
+| | chrome-devtools | playwright |
+|---|---|---|
+| 复用你现有 Chrome 登录态 | ✅ 强项（`--browserUrl`） | 需另开 profile 登录一次 |
+| 网络 / 控制台 / 性能分析 | ✅ 很全 | 一般 |
+| 页面元素定位稳定性 | 一般 | ✅ 更好 |
+| 跨浏览器、并行任务 | ❌ | ✅（`--isolated`） |
+| 配套 skill | ✅ 本仓库这 6 个 | ❌ |
+
+**登录 + 做操作的场景选 `chrome-devtools`**，skill 也是为它写的。
 
 ---
 
@@ -41,9 +63,13 @@ powershell -ExecutionPolicy Bypass -File setup-browser-control.ps1
 ### 手动装
 
 ```bash
-claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest
+claude mcp add chrome-devtools --scope user -- npx chrome-devtools-mcp@latest
+claude mcp add playwright      --scope user -- npx @playwright/mcp@latest
 cp -r .claude/skills/* ~/.claude/skills/
 ```
+
+注意 `--` 的位置：紧跟在 server 名字后面，后面才是命令和参数。
+`--scope user` 不能省 —— 省了就只写进当前目录的 local scope，换个目录就失效。
 
 ---
 

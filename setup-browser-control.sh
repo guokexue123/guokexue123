@@ -29,14 +29,25 @@ for d in "$SRC"/*/; do
   fi
 done
 
-echo "==> 2/3 注册 chrome-devtools MCP server（user scope）"
+echo "==> 2/3 注册 MCP server（user scope）"
+# 两个浏览器 server 工具高度重叠，装完建议只留一个：
+#   claude mcp remove playwright --scope user
 if ! command -v claude >/dev/null 2>&1; then
   echo "    找不到 claude CLI，跳过。装好后手动运行："
-  echo "    claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest"
-elif claude mcp get chrome-devtools >/dev/null 2>&1; then
-  echo "    已注册，跳过"
+  echo "    claude mcp add chrome-devtools --scope user -- npx chrome-devtools-mcp@latest"
+  echo "    claude mcp add playwright      --scope user -- npx @playwright/mcp@latest"
 else
-  claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest
+  add_server() {
+    local name="$1"; shift
+    if claude mcp get "$name" >/dev/null 2>&1; then
+      echo "    $name 已注册，跳过"
+    else
+      claude mcp add "$name" --scope user -- "$@"
+      echo "    注册 $name"
+    fi
+  }
+  add_server chrome-devtools npx chrome-devtools-mcp@latest
+  add_server playwright      npx @playwright/mcp@latest
 fi
 
 echo "==> 3/3 检查依赖"

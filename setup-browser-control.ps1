@@ -27,16 +27,26 @@ Get-ChildItem -Path $Src -Directory | ForEach-Object {
   }
 }
 
-Write-Host "==> 2/3 注册 chrome-devtools MCP server（user scope）"
+Write-Host "==> 2/3 注册 MCP server（user scope）"
+# 两个浏览器 server 工具高度重叠，装完建议只留一个：
+#   claude mcp remove playwright --scope user
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
   Write-Host "    找不到 claude CLI，跳过。装好后手动运行："
-  Write-Host "    claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest"
+  Write-Host "    claude mcp add chrome-devtools --scope user -- npx chrome-devtools-mcp@latest"
+  Write-Host "    claude mcp add playwright      --scope user -- npx @playwright/mcp@latest"
 } else {
-  claude mcp get chrome-devtools *>$null
-  if ($LASTEXITCODE -eq 0) {
-    Write-Host "    已注册，跳过"
-  } else {
-    claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest
+  $servers = @(
+    @{ Name = 'chrome-devtools'; Args = @('npx', 'chrome-devtools-mcp@latest') },
+    @{ Name = 'playwright';      Args = @('npx', '@playwright/mcp@latest') }
+  )
+  foreach ($s in $servers) {
+    claude mcp get $s.Name *>$null
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host "    $($s.Name) 已注册，跳过"
+    } else {
+      claude mcp add $s.Name --scope user -- @($s.Args)
+      Write-Host "    注册 $($s.Name)"
+    }
   }
 }
 
