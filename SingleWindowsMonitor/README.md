@@ -29,13 +29,14 @@
 
 ## 安装
 
-```bash
-pip install -r requirements.txt
-# 只有走浏览器兜底方案时才需要，接口正常时可以不装：
-python -m playwright install chromium
-```
+**不用装任何东西。** 把这几个 .py 文件拷到原来的目录，覆盖掉旧的就行。
 
-Python 3.8+。接口方案只用标准库（`urllib` + `json`），不依赖第三方包。
+Python 3.8+ 即可。日常取数走官网 JSON 接口，只用标准库（`urllib` + `json`），
+不依赖第三方包 —— 内网机器连不上 PyPI 也没关系。
+
+`playwright` / `beautifulsoup4` 只在接口不可用、降级为浏览器抓取时才用到，
+属于保险不是必需（详见 `requirements-optional.txt`）。这台机器上原来就装着，
+不用重新装；`--self-test` 里这两项即使 FAIL 也不影响出报。
 
 ## 运行
 

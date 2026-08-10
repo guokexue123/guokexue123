@@ -1,0 +1,13 @@
+# ⚠ 正常运行【不需要】装任何东西。
+#
+# 日常取数走官网 JSON 接口，只用 Python 标准库（urllib + json）。
+# 下面两个包只在接口不可用、降级为浏览器抓取时才会用到，属于保险，不是必需：
+#
+#     playwright>=1.40      起浏览器渲染首页
+#     beautifulsoup4>=4.12  解析首页 DOM
+#
+# 机器能上 PyPI 时才装（内网机器装不了也没关系，--self-test 会把这两项
+# 标成非致命的 FAIL，接口通就照常出报）：
+#
+#     pip install playwright beautifulsoup4
+#     python -m playwright install chromium
