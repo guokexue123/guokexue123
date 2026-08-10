@@ -76,7 +76,9 @@ FEATURE_COUNT     = 5      # 新特性展示条数
 DETAIL_MAX_CHARS  = 900    # 每条正文最多展示多少字（0 = 不截断）
 NEW_DAYS          = 3      # 几天内发布的标 NEW
 
-API_TIMEOUT  = 20          # 秒
+API_TIMEOUT     = 20       # 秒
+API_RETRY       = 3        # 单个接口最多试几次
+API_RETRY_WAIT  = 2        # 秒，重试间隔（按次数递增）
 PAGE_TIMEOUT = 30_000      # ms，Playwright 回退用
 RENDER_WAIT  = 5           # 秒，等待 Vue 渲染
 OUTPUT_FILE  = Path(__file__).parent / "singlewindow_output.html"
@@ -109,11 +111,20 @@ def _api_post(path, payload):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
-        body = json.loads(resp.read().decode("utf-8", "replace"))
-    if body.get("status") != "success":
-        raise RuntimeError("接口返回失败：{}".format(body.get("message") or body))
-    return body.get("data")
+    # 每天无人值守跑，偶发的网络抖动不该直接把整封邮件打回摘要版，重试几次
+    last_err = None
+    for attempt in range(1, API_RETRY + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+            if body.get("status") != "success":
+                raise RuntimeError("接口返回失败：{}".format(body.get("message") or body))
+            return body.get("data")
+        except (urllib.error.URLError, TimeoutError, ValueError, RuntimeError, OSError) as exc:
+            last_err = exc
+            if attempt < API_RETRY:
+                time.sleep(API_RETRY_WAIT * attempt)
+    raise last_err
 
 
 def _ts_to_dt(value):
@@ -383,6 +394,81 @@ def collect(args):
 
 
 # ══════════════════════════════════════════════════════════
+#  自检：部署到新机器 / 排查故障时先跑这个
+# ══════════════════════════════════════════════════════════
+def self_test(args):
+    """逐项检查依赖，不发信、不写文件。全部通过返回 0。"""
+    checks = []
+
+    def record(name, ok, detail=""):
+        checks.append((name, ok, detail))
+        print("  [{}] {}{}".format("OK  " if ok else "FAIL", name,
+                                   "  —— " + detail if detail else ""))
+
+    print("\n  ── 自检开始 ──")
+
+    # 1. 列表接口
+    notices = []
+    try:
+        notices = fetch_via_api(CATALOG_NOTICE, BREAD_NOTICE, 1, with_body=False)
+        record("官网列表接口（最新动态）", bool(notices),
+               "取到 {} 条".format(len(notices)) if notices else "返回空")
+    except Exception as exc:
+        record("官网列表接口（最新动态）", False, str(exc))
+
+    # 2. 详情接口（正文全文靠它）
+    if notices and notices[0].get("id"):
+        try:
+            detail = _api_post("Article002", {"articleid": notices[0]["id"]}) or {}
+            body = detail.get("bodytext") or ""
+            record("官网详情接口（正文全文）", bool(body), "正文 {} 字".format(len(body)))
+        except Exception as exc:
+            record("官网详情接口（正文全文）", False, str(exc))
+    else:
+        record("官网详情接口（正文全文）", False, "上一步没拿到文章 ID，跳过")
+
+    # 3. 兜底方案的依赖（缺了不影响日常运行，只是没了保险）
+    for mod, why in (("playwright", "接口不可用时用它渲染首页"),
+                     ("bs4", "解析首页 DOM")):
+        try:
+            __import__(mod)
+            record("兜底依赖 {}".format(mod), True, why)
+        except ImportError:
+            record("兜底依赖 {}".format(mod), False, "未安装（{}）".format(why))
+
+    # 4. SMTP 只连不发
+    try:
+        import smtplib
+        smtp = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=15)
+        smtp.ehlo()
+        smtp.quit()
+        record("SMTP 连通性 {}:{}".format(SMTP_SERVER, SMTP_PORT), True, "只握手，未发信")
+    except Exception as exc:
+        record("SMTP 连通性 {}:{}".format(SMTP_SERVER, SMTP_PORT), False, str(exc))
+
+    # 5. 输出目录可写
+    try:
+        probe = OUTPUT_FILE.parent / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        record("输出目录可写 {}".format(OUTPUT_FILE.parent), True)
+    except Exception as exc:
+        record("输出目录可写 {}".format(OUTPUT_FILE.parent), False, str(exc))
+
+    # 兜底依赖缺失不算致命：接口通就能正常出报
+    fatal = [n for n, ok, _ in checks if not ok and not n.startswith("兜底依赖")]
+    print("  ── 自检结束 ──\n")
+    if fatal:
+        print("  [FAIL] 以下项目需要处理：{}".format("、".join(fatal)))
+        return 1
+    if any(not ok for _, ok, _ in checks):
+        print("  [OK] 关键项全部通过（兜底依赖未装，接口异常时将没有备用方案）")
+    else:
+        print("  [OK] 全部通过")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════
 #  入口
 # ══════════════════════════════════════════════════════════
 def main():
@@ -398,16 +484,21 @@ def main():
     parser.add_argument("--show", action="store_true", help="回退到浏览器时显示窗口")
     parser.add_argument("--browser", choices=["auto", "edge", "chrome", "builtin"],
                         default="auto", help="回退方案使用的浏览器")
+    parser.add_argument("--self-test", action="store_true",
+                        help="只做环境自检（接口/依赖/SMTP/目录），不抓取也不发信")
     args = parser.parse_args()
 
     print("=" * 52)
     print("  中国国际贸易单一窗口  每日监控简报")
     print("=" * 52)
 
+    if args.self_test:
+        return self_test(args)
+
     notices, features, source_label = collect(args)
 
     now = datetime.now(CN_TZ).replace(tzinfo=None)
-    html_text = sw_render.build_email_html(notices, features, {
+    ctx = {
         "base_url": BASE_URL,
         "notice_more_url": NOTICE_URL,
         "feature_more_url": FEATURE_URL,
@@ -415,7 +506,8 @@ def main():
         "source_label": source_label,
         "detail_max_chars": args.detail_chars,
         "new_days": args.new_days,
-    })
+    }
+    html_text = sw_render.build_email_html(notices, features, ctx)
     OUTPUT_FILE.write_text(html_text, encoding="utf-8")
 
     if not args.no_mail:
@@ -427,14 +519,20 @@ def main():
             subject="单一窗口每日监控 · 最新动态与新特性（{:%Y-%m-%d}）".format(now),
             receivers=receivers,
             cc=CC,
+            text_content=sw_render.build_plain_text(notices, features, ctx),
         )
 
+    ok = bool(notices or features)
     print("\n" + "=" * 52)
-    print("[OK] 输出文件 : {}".format(OUTPUT_FILE))
+    print("[{}] 输出文件 : {}".format("OK" if ok else "WARN", OUTPUT_FILE))
     print("     数据来源 : {}".format(source_label))
     print("     最新动态 : {} 条".format(len(notices)))
     print("     新特性   : {} 条".format(len(features)))
+    if not ok:
+        # 返回非 0，Windows 计划任务里会显示为失败，不至于一直发空邮件没人发现
+        print("     两个栏目都没抓到内容，请检查网络或运行 --self-test")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

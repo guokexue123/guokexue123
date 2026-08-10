@@ -14,6 +14,9 @@
 | 页面骨架 | 仿官网整站（顶栏、导航、搜索框、页脚），div + flex + 外部 CSS | 邮件专用模板：table 布局 + 全内联样式，Outlook / 手机都不会散版 |
 | 日期 | 跟随服务器时区，可能差一天 | 统一按北京时间换算 |
 | 邮件标题 | 未做 RFC 2047 编码 | 中文主题正确编码，并补上 `Date` / `Message-ID` |
+| 邮件格式 | 只有 HTML 一份 | HTML + 纯文本双份（`multipart/alternative`），降低被网关判垃圾的概率 |
+| 抓取失败 | 静默发一封空邮件，退出码仍是 0 | 接口自动重试 3 次；两个栏目都空时退出码 1，计划任务里能看到失败 |
+| 排错 | 只能等第二天的邮件 | `--self-test` 一次性检查接口 / 依赖 / SMTP / 目录权限 |
 
 ## 文件说明
 
@@ -38,6 +41,7 @@ Python 3.8+。接口方案只用标准库（`urllib` + `json`），不依赖第�
 
 ```bash
 python singlewindow_scraper.py                  # 抓取 + 生成 HTML + 发邮件（生产用法）
+python singlewindow_scraper.py --self-test      # 部署到新机器后先跑这个（不抓取、不发信）
 python singlewindow_scraper.py --no-mail        # 只生成 HTML，不发邮件（调样式时用）
 python singlewindow_scraper.py --notices 8 --features 8
 python singlewindow_scraper.py --detail-chars 1500     # 正文展示更长；0 = 不截断
@@ -47,6 +51,28 @@ python singlewindow_scraper.py --browser-only          # 强制走浏览器兜�
 ```
 
 Windows 计划任务原来怎么配就还怎么配，入口文件名和输出文件名都没变。
+
+### 退出码
+
+| 值 | 含义 |
+|---|---|
+| 0 | 正常，至少抓到一条内容 |
+| 1 | 两个栏目都没抓到（或自检有关键项没过）——计划任务会显示为失败 |
+
+### 部署到新机器 / 出问题时
+
+```
+> python singlewindow_scraper.py --self-test
+
+  [OK  ] 官网列表接口（最新动态）  —— 取到 1 条
+  [OK  ] 官网详情接口（正文全文）  —— 正文 129 字
+  [OK  ] 兜底依赖 playwright  —— 接口不可用时用它渲染首页
+  [OK  ] 兜底依赖 bs4  —— 解析首页 DOM
+  [OK  ] SMTP 连通性 smtp.cn.dhl.com:25  —— 只握手，未发信
+  [OK  ] 输出目录可写 D:\Monitor\SingleWindowsMonitor
+```
+
+兜底依赖没装不算致命（接口通就能正常出报），其余任意一项 FAIL 都要先处理。
 
 ## 常用配置
 

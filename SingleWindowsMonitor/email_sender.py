@@ -37,7 +37,8 @@ class HtmlEmailSender:
             html_file,
             subject,
             receivers,
-            cc=None
+            cc=None,
+            text_content=None
     ):
 
         if cc is None:
@@ -68,6 +69,17 @@ class HtmlEmailSender:
         msg["Subject"] = Header(subject, "utf-8")
         msg["Date"] = formatdate(localtime=True)
         msg["Message-ID"] = make_msgid(domain=self.sender_email.split("@")[-1])
+
+        # multipart/alternative 里顺序有意义：纯文本在前、HTML 在后，
+        # 支持 HTML 的客户端取最后一个，纯文本只是给网关和降级场景兜底
+        if text_content:
+            msg.attach(
+                MIMEText(
+                    text_content,
+                    "plain",
+                    "utf-8"
+                )
+            )
 
         msg.attach(
             MIMEText(

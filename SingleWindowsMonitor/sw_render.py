@@ -202,8 +202,12 @@ def body_to_paragraphs(raw, base_url, max_chars=0):
 
 
 def clean_title(raw):
-    """标题里常带换行和大段空格（如"货物申报\\n    2026年07月29日版本"）。"""
-    return _RE_SPACES.sub(" ", str(raw or "").replace("\n", " ")).strip()
+    """
+    标题里常带换行和大段空格（如"货物申报\\n    2026年07月29日版本"）。
+    顺手去掉可能混进来的标签 —— HTML 版会转义，纯文本版没有转义可依赖。
+    """
+    text = _RE_TAG.sub("", str(raw or "").replace("\n", " "))
+    return _RE_SPACES.sub(" ", html.unescape(text)).strip()
 
 
 # ══════════════════════════════════════════════════════════
@@ -340,6 +344,68 @@ def _stat_cell(label, value, color):
         '</td>'
     ).format(font=FONT, color=color, muted=C_MUTED,
              value=html.escape(str(value)), label=html.escape(label))
+
+
+# ══════════════════════════════════════════════════════════
+#  纯文本版（multipart/alternative 的另一半）
+# ══════════════════════════════════════════════════════════
+_RE_FRAG_ANCHOR = re.compile(r'<a\b[^>]*?href="(.*?)"[^>]*>(.*?)</a>', re.I | re.S)
+
+
+def _frag_to_text(fragment):
+    """
+    把渲染好的段落片段转回纯文本。链接要还原成完整地址 ——
+    HTML 版靠 href 兜底所以可以缩短显示，纯文本版没有 href 可点。
+    """
+    def _unwrap(m):
+        url = html.unescape(m.group(1))
+        label = html.unescape(_RE_TAG.sub("", m.group(2)))
+        if not label or label.rstrip("…/") in url:
+            return url
+        return "{}（{}）".format(label, url)
+
+    return html.unescape(_RE_TAG.sub("", _RE_FRAG_ANCHOR.sub(_unwrap, fragment)))
+
+
+def build_plain_text(notices, features, ctx):
+    """
+    只发 HTML 的邮件在部分网关会被判定为垃圾邮件，同时带一份纯文本更稳妥。
+    支持 HTML 的客户端（Outlook / 手机）仍然只会显示上面那份 HTML。
+    """
+    now = ctx.get("fetch_time") or datetime.now()
+    base_url = ctx.get("base_url", "https://www.singlewindow.cn")
+    max_chars = int(ctx.get("detail_max_chars", 900))
+
+    out = ["中国国际贸易单一窗口 · 每日监控简报",
+           "{}年{}月{}日 {}　抓取于 {}".format(now.year, now.month, now.day,
+                                          _WEEK_CN[now.weekday()],
+                                          now.strftime("%Y-%m-%d %H:%M")),
+           "=" * 46]
+
+    for name, items in (("最新动态（通知公告）", notices), ("新特性", features)):
+        out += ["", "【{}】共 {} 条".format(name, len(items)), "-" * 46]
+        if not items:
+            out.append("  本次未获取到数据")
+            continue
+        for idx, item in enumerate(items, 1):
+            dt = item.get("dt")
+            out.append("{}. {}{}".format(
+                idx, clean_title(item.get("title")),
+                "（{}）".format(dt.strftime("%Y-%m-%d")) if dt else ""))
+            paragraphs, _ = body_to_paragraphs(item.get("body"), base_url, max_chars)
+            if not paragraphs:
+                summary = clean_title(item.get("summary"))
+                paragraphs = [html.escape(summary, quote=False)] if summary else []
+            for para in paragraphs:
+                out.append("   " + _frag_to_text(para))
+            out.append("   原文：" + (item.get("url") or base_url))
+            out.append("")
+
+    out += ["=" * 46,
+            "本邮件由监控脚本自动抓取 {} 生成，内容以官网原文为准。".format(base_url),
+            "数据来源：{}".format(ctx.get("source_label", "")),
+            "生成时间：{}".format(now.strftime("%Y-%m-%d %H:%M:%S"))]
+    return "\n".join(out)
 
 
 # ══════════════════════════════════════════════════════════
